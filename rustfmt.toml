@@ -1,0 +1,6 @@
+max_width = 120
+imports_granularity = "Crate"
+imports_layout = "Vertical"
+group_imports = "One"
+comment_width = 120
+wrap_comments = true

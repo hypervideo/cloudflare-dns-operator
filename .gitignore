@@ -1,0 +1,6 @@
+/target
+/.direnv/
+/.dir-locals.el
+/crds.yaml
+/test.yaml
+/.env
