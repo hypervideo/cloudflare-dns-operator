@@ -7,8 +7,8 @@ rustPlatform.buildRustPackage {
   version = "0.1.1";
   pname = name;
 
-  cargoHash = "sha256-GLyxBTZDYaQgBXYRr0ClS5ye4tMPOkT0EfljPSykF5E=";
-  src = ./.;
+  cargoHash = "sha256-o9kVVmF3jQ7wJz4InCgCucgyPcyP29kv2LFAt8pcu2E=";
+  src = ../.;
 
   meta = with lib; {
     homepage = "https://github.com/hypervideo/cloudflare-dns-operator";
