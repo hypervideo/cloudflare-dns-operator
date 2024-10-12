@@ -45,7 +45,10 @@ enum Args {
 }
 
 #[derive(Parser)]
-struct ArgsController {}
+struct ArgsController {
+    #[clap(long, env = "CLOUDFLARE_API_TOKEN")]
+    cloudflare_api_token: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,7 +76,7 @@ enum Error {
     Unexpected(#[from] eyre::Error),
 }
 
-async fn run_controller(ArgsController {}: ArgsController) -> Result<()> {
+async fn run_controller(ArgsController { cloudflare_api_token }: ArgsController) -> Result<()> {
     // Load the kubeconfig file.
     let client = kube::Client::try_default().await?;
     let owned = Api::<resources::CloudflareDNSRecord>::all(client.clone());
@@ -90,7 +93,14 @@ async fn run_controller(ArgsController {}: ArgsController) -> Result<()> {
         )
         .owns(secrets, Default::default())
         .shutdown_on_signal()
-        .run(reconcile, error_policy, Arc::new(ControllerState { client }))
+        .run(
+            reconcile,
+            error_policy,
+            Arc::new(ControllerState {
+                client,
+                cloudflare_api_token,
+            }),
+        )
         .for_each(|msg| async move { info!("Reconciled: {:?}", msg) })
         .await;
 

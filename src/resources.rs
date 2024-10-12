@@ -81,10 +81,6 @@ pub struct CloudflareDNSRecordSpec {
     /// The cloudflare zone ID to create the record in
     #[serde(rename = "zoneId")]
     pub zone_id: ValueOrReference,
-
-    /// The cloudflare api token to use
-    #[serde(rename = "apiToken")]
-    pub api_token: ValueOrReference,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
