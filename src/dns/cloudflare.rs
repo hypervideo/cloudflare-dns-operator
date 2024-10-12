@@ -164,6 +164,7 @@ pub async fn update_dns_record_and_wait(args: CreateRecordArgs) -> Result<DnsRec
 }
 
 /// Delete a DNS record by its (domain) name using the cloudflare API
+#[allow(dead_code)]
 pub async fn delete_dns_record_by_name(
     name: impl AsRef<str>,
     zone_identifier: impl AsRef<str>,

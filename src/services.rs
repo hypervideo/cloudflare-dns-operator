@@ -71,34 +71,34 @@ fn select_ip(ips: Vec<IpAddr>, record_type: Option<RecordType>, name: &str, ns: 
     match (&ips[..], record_type) {
         ([], None) => {
             warn!("Service {ns}/{name} has no lb/external ip");
-            return None;
+            None
         }
 
         // Single ipv4
-        ([ip @ IpAddr::V4(_)], Some(RecordType::A)) => return Some(*ip),
+        ([ip @ IpAddr::V4(_)], Some(RecordType::A)) => Some(*ip),
         ([ip @ IpAddr::V4(_)], Some(RecordType::AAAA)) => {
             warn!("Expected ipv6 address, but found ipv4 address");
-            return Some(*ip);
+            Some(*ip)
         }
 
         // Single ipv6
         ([ip @ IpAddr::V6(_)], Some(RecordType::A)) => {
             warn!("Expected ipv4 address, but found ipv4 address");
-            return Some(*ip);
+            Some(*ip)
         }
-        ([ip @ IpAddr::V6(_)], Some(RecordType::AAAA)) => return Some(*ip),
+        ([ip @ IpAddr::V6(_)], Some(RecordType::AAAA)) => Some(*ip),
 
         // Single ip, no hint
-        ([ip], _) => return Some(*ip),
+        ([ip], _) => Some(*ip),
 
         // multiple ips with hint
-        (ips, Some(RecordType::A)) => return Some(ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0])),
-        (ips, Some(RecordType::AAAA)) => return Some(ips.iter().find(|ip| ip.is_ipv6()).copied().unwrap_or(ips[0])),
+        (ips, Some(RecordType::A)) => Some(ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0])),
+        (ips, Some(RecordType::AAAA)) => Some(ips.iter().find(|ip| ip.is_ipv6()).copied().unwrap_or(ips[0])),
 
         // No uselful hint
         (ips, _) => {
             warn!("Service {ns}/{name} has multiple load balancer ips, using the first ipv4 one or the first one if none are ipv4");
-            return Some(ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0]));
+            Some(ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0]))
         }
     }
 }

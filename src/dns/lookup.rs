@@ -19,6 +19,7 @@ use std::{
 };
 use tokio::time::sleep;
 
+#[allow(dead_code)]
 pub async fn wait_for_dns_record(
     domain: &str,
     ip: std::net::Ipv4Addr,
@@ -36,7 +37,7 @@ pub async fn wait_for_dns_record(
             }
         }
 
-        let ips = match get_a_records(&domain).await {
+        let ips = match get_a_records(domain).await {
             Ok(ips) => ips.into_iter().collect::<HashSet<_>>(),
             Err(e) => {
                 warn!("Failed to resolve DNS record: {e}");

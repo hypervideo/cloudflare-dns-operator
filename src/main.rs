@@ -91,14 +91,7 @@ async fn run_controller(ArgsController {}: ArgsController) -> Result<()> {
         )
         .owns(secrets, Default::default())
         .shutdown_on_signal()
-        .run(
-            reconcile,
-            error_policy,
-            Arc::new(ControllerState {
-                client,
-                latest_dns_specs: Default::default(),
-            }),
-        )
+        .run(reconcile, error_policy, Arc::new(ControllerState { client }))
         .for_each(|msg| async move { info!("Reconciled: {:?}", msg) })
         .await;
 
