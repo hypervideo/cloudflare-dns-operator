@@ -39,6 +39,7 @@ use std::{
 };
 
 #[derive(Parser)]
+#[command(version, about)]
 enum Args {
     Crds,
     Controller(ArgsController),

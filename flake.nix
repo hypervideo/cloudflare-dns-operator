@@ -10,8 +10,10 @@
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
 
+        name = "cloudflare-dns-operator";
+
         cloudflare-dns-operator = pkgs.rustPlatform.buildRustPackage {
-          pname = "cloudflare-dns-operator";
+          pname = name;
           version = "0.1.0";
 
           cargoHash = "sha256-d2/RG2ZHvxhFkkUQFwJDLwhWjp8E27Hq4Nm9WlqWhY4=";
@@ -22,6 +24,37 @@
             description = "This is a kubernetes operator to manage cloudflare DNS entries from within kubernetes.";
             mainProgram = "cloudflare-dns-operator";
             maintainers = with maintainers; [ rksm ];
+          };
+        };
+
+        base-image = pkgs.dockerTools.buildImage {
+          name = "${name}-base";
+          extraCommands = ''
+            mkdir -p tmp
+          '';
+          copyToRoot = pkgs.buildEnv {
+            name = "image-root";
+            paths = with pkgs; [
+              cacert
+              coreutils
+              bashInteractive
+            ];
+            pathsToLink = [ "/bin" ];
+          };
+        };
+
+        image = pkgs.dockerTools.buildImage {
+          inherit name;
+          tag = "latest";
+          created = "now";
+          fromImage = base-image;
+          copyToRoot = pkgs.buildEnv {
+            name = "image-root";
+            paths = [ cloudflare-dns-operator ];
+            pathsToLink = [ "/bin" ];
+          };
+          config = {
+            Cmd = [ "/bin/${name}" "controller" ];
           };
         };
 
@@ -50,7 +83,7 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
 
-        packages = { inherit cloudflare-dns-operator; };
+        packages = { inherit cloudflare-dns-operator image; };
       }
     );
 }
