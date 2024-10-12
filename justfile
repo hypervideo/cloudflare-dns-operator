@@ -17,6 +17,12 @@ version:
 run *args="":
     cargo run -- {{ args }}
 
+tests:
+    cargo nextest run
+
+udeps:
+    CARGO_TARGET_DIR="./target/udeps" nix develop .#nightly -c cargo udeps
+
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 IMAGE_NAME := "cloudflare-dns-operator"
@@ -29,7 +35,7 @@ bump-version:
     new_version=$(semver bump patch $old_version)
     echo "Bumping version to $new_version"
     sed -i "s/^version = \"$old_version\"/version = \"$new_version\"/" Cargo.toml
-    sed -i "s/version = \"$old_version\"/version = \"$new_version\"/" flake.nix
+    sed -i "s/version = \"$old_version\"/version = \"$new_version\"/" nix/package.nix
 
 docker-build:
     nix build '.#image' |& nom
