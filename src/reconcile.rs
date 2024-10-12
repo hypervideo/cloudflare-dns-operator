@@ -1,9 +1,13 @@
 use super::ControllerState;
 use crate::{
-    dns::cloudflare,
+    dns::cloudflare::{
+        self,
+        Zone,
+    },
     resources::{
         CloudflareDNSRecord,
         StringOrService,
+        ZoneNameOrId,
     },
     services::public_ip_from_service,
 };
@@ -54,16 +58,36 @@ pub async fn update(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState
         }
     };
 
-    let Some(zone_id) = &resource.spec.zone_id.lookup(client, ns).await? else {
-        error!("zone id not found for CloudflareDNSRecord {ns}/{name}");
+    let zone = match &resource.spec.zone {
+        ZoneNameOrId::Name(it) => {
+            let Some(name) = it.lookup(client, ns).await? else {
+                error!("unable to resolve {it:?} for CloudflareDNSRecord {ns}/{name}");
+                return Ok(());
+            };
+            Zone::name(name)
+        }
+        ZoneNameOrId::Id(it) => {
+            let Some(id) = it.lookup(client, ns).await? else {
+                error!("unable to resolve {it:?} for CloudflareDNSRecord {ns}/{name}");
+                return Ok(());
+            };
+            Zone::id(id)
+        }
+    };
+
+    let Some(zone) = zone.resolve(&ctx.cloudflare_api_token).await? else {
+        error!("unable to resolve zone for CloudflareDNSRecord {ns}/{name}");
         return Ok(());
+    };
+    let Zone::Identifier(zone_id) = zone.clone() else {
+        unreachable!();
     };
 
     debug!("updating dns record for CloudflareDNSRecord {ns}/{name}");
 
     let record = cloudflare::update_dns_record_and_wait(cloudflare::CreateRecordArgs {
         api_token: ctx.cloudflare_api_token.clone(),
-        zone_identifier: zone_id.clone(),
+        zone,
         name: resource.spec.name.clone(),
         record_type: resource.spec.type_.unwrap_or_default(),
         content,

@@ -42,6 +42,7 @@ use std::{
 enum Args {
     Crds,
     Controller(ArgsController),
+    ListZones(ArgsController),
 }
 
 #[derive(Parser)]
@@ -62,6 +63,10 @@ async fn main() -> Result<()> {
         }
         Args::Controller(args) => {
             run_controller(args).await?;
+        }
+        Args::ListZones(args) => {
+            let zones = dns::cloudflare::list_zones(&args.cloudflare_api_token).await?;
+            dbg!(zones);
         }
     }
 

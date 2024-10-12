@@ -35,6 +35,62 @@ pub struct ApiResultInfo {
     total_pages: usize,
 }
 
+// -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+// account
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Account {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Owner {
+    email: Option<String>,
+    id: Option<String>,
+    r#type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Plan {
+    can_subscribe: bool,
+    currency: String,
+    externally_managed: bool,
+    frequency: String,
+    id: String,
+    is_subscribed: bool,
+    legacy_discount: bool,
+    legacy_id: String,
+    name: String,
+    price: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountInfo {
+    account: Account,
+    id: String,
+    name: String,
+    activated_on: DateTime<Utc>,
+    created_on: DateTime<Utc>,
+    modified_on: Option<DateTime<Utc>>,
+    development_mode: i64,
+    meta: Value,
+    name_servers: Vec<String>,
+    original_dnshost: Option<Value>,
+    original_name_servers: Option<Value>,
+    original_registrar: Option<Value>,
+    owner: Owner,
+    paused: bool,
+    permissions: Vec<String>,
+    plan: Plan,
+    status: String,
+    tenant: Value,
+    tenant_unit: Value,
+    r#type: String,
+}
+
+// -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
 /// https://developers.cloudflare.com/api/operations/zones-get?schema_url=https%3A%2F%2Fraw.githubusercontent.com%2Fcloudflare%2Fapi-schemas%2Fmain%2Fopenapi.yaml
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DnsRecordInfo {
@@ -85,10 +141,40 @@ pub struct DnsRecordModification {
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
+pub enum Zone {
+    Identifier(String),
+    Name(String),
+}
+
+impl Zone {
+    pub fn id(id: impl ToString) -> Self {
+        Zone::Identifier(id.to_string())
+    }
+
+    pub fn name(name: impl ToString) -> Self {
+        Zone::Name(name.to_string())
+    }
+
+    pub async fn resolve(self, api_token: &str) -> Result<Option<Self>> {
+        self.lookup_id(api_token).await.map(|id| id.map(Zone::Identifier))
+    }
+
+    pub async fn lookup_id(self, api_token: &str) -> Result<Option<String>> {
+        match self {
+            Zone::Identifier(id) => Ok(Some(id)),
+            Zone::Name(name) => {
+                debug!(?name, "looking up zone by name");
+                let accounts = list_zones(api_token).await?;
+                Ok(accounts.into_iter().find(|it| it.name == name).map(|it| it.id))
+            }
+        }
+    }
+}
+
 pub struct CreateRecordArgs {
     pub api_token: String,
-    pub zone_identifier: String,
+    pub zone: Zone,
     pub name: String,
     pub record_type: RecordType,
     pub content: String,
@@ -96,17 +182,27 @@ pub struct CreateRecordArgs {
     pub ttl: Option<i64>,
 }
 
+pub async fn list_zones(api_token: &str) -> Result<Vec<AccountInfo>, eyre::Error> {
+    let url = "https://api.cloudflare.com/client/v4/zones";
+    request::<Vec<AccountInfo>, ()>(url, None, Method::GET, api_token).await
+}
+
 /// Create a new cloudflare dns record
 pub async fn create_dns_record(args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
     let CreateRecordArgs {
         api_token,
-        zone_identifier,
+        zone,
         name,
         record_type,
         content,
         comment,
         ttl,
     } = args;
+
+    let zone_identifier = zone
+        .lookup_id(&api_token)
+        .await?
+        .ok_or_else(|| eyre::eyre!("zone not found"))?;
 
     let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
     let id = util::id();
@@ -136,7 +232,9 @@ pub async fn create_dns_record(args: CreateRecordArgs) -> Result<DnsRecordInfo, 
 /// correct ip.
 /// TODO: we should use the proper patch api.
 pub async fn update_dns_record_and_wait(args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
-    let zone_id = args.zone_identifier.clone();
+    let Some(zone_id) = args.zone.clone().lookup_id(&args.api_token).await? else {
+        bail!("zone not found");
+    };
     let api_token = args.api_token.clone();
     let domain = args.name.clone();
 

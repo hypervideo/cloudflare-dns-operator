@@ -77,10 +77,16 @@ pub struct CloudflareDNSRecordSpec {
     pub comment: Option<String>,
     /// Tags to apply to the record
     pub tags: Option<Vec<String>>,
-
     /// The cloudflare zone ID to create the record in
-    #[serde(rename = "zoneId")]
-    pub zone_id: ValueOrReference,
+    pub zone: ZoneNameOrId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum ZoneNameOrId {
+    #[serde(rename = "name")]
+    Name(ValueOrReference),
+    #[serde(rename = "id")]
+    Id(ValueOrReference),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

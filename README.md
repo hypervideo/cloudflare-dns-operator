@@ -6,7 +6,7 @@ __Note:__ This is an unofficial project and not affiliated in any way with cloud
 
 ## Installation
 
-In your kubernetes cluster install the [`crds.yaml`](./crds.yaml) file and a deployment matching [examples/deployment.yaml](./examples/deployment.yaml).
+In your kubernetes cluster install the [`crds.yaml`](./crds.yaml) file and a deployment matching [examples/deployment.yaml](./examples/deployment.yaml). Note that you'll need to set the env var `CLOUDFLARE_API_TOKEN` to a valid cloudflare API token.
 
 This sets up the controller as a deployment. It'll watch for `CloudflareDNSRecord` resources and create/update/delete DNS records in cloudflare.
 
@@ -18,20 +18,13 @@ kind: CloudflareDNSRecord
 metadata:
   name: my-cloudflare-dns-record
 spec:
-  name: example.com
+  name: foo.example.com
   type: A
   ttl: 3600
   content: "1.2.3.4"
-  zoneId:
-    from:
-      secret:
-        name: cloudflare-dns-secret
-        key: zone-id
-  apiToken:
-    from:
-      secret:
-        name: cloudflare-dns-secret
-        key: api-token
+  zone:
+    name:
+      value: example.com
   comment: "Managed by the Cloudflare DNS Operator"
   tags:
     - k8s
@@ -48,12 +41,16 @@ You can also automatically expose LoadBalancer services or external IP services 
 # ...
 ```
 
-API token and zone ID can also be set verbatim (not recommended):
+The zone can also be set with a `secret` or `configMap` reference like this:
 
 ``` yaml
 # ...
-  zoneId:
-    value: "1234567890abcdef1234567890abcdef"
+  zone:
+    name:
+      from:
+        secret:
+          name: cloudflare-dns-secret
+          key: zone-name
 # ...
 ```
 

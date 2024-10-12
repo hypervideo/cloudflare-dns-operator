@@ -29,6 +29,11 @@ spec:
           value: "debug"
         - name: RUST_BACKTRACE
           value: "1"
+        - name: CLOUDFLARE_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflare-api-token
+              key: api-token
 ---
 
 apiVersion: v1
