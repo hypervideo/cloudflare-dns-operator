@@ -23,7 +23,6 @@ use kube::{
         Controller,
     },
     Api,
-    Client,
     CustomResourceExt as _,
     Resource as _,
 };
@@ -76,8 +75,7 @@ enum Error {
 
 async fn run_controller(ArgsController {}: ArgsController) -> Result<()> {
     // Load the kubeconfig file.
-    let config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions::default()).await?;
-    let client = Client::try_from(config)?;
+    let client = kube::Client::try_default().await?;
     let owned = Api::<resources::CloudflareDNSRecord>::all(client.clone());
     let secrets = Api::<Secret>::all(client.clone());
 

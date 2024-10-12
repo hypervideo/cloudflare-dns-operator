@@ -22,6 +22,15 @@ run *args="":
 IMAGE_NAME := "cloudflare-dns-operator"
 DOCKER_REGISTRY := "robertkrahn"
 
+bump-version:
+    #!/usr/bin/env sh
+    set -e
+    old_version=$(just version)
+    new_version=$(semver bump patch $old_version)
+    echo "Bumping version to $new_version"
+    sed -i "s/^version = \"$old_version\"/version = \"$new_version\"/" Cargo.toml
+    sed -i "s/version = \"$old_version\"/version = \"$new_version\"/" flake.nix
+
 docker-build:
     nix build '.#image' |& nom
     docker load < ./result

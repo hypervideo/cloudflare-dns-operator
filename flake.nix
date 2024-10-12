@@ -13,8 +13,8 @@
         name = "cloudflare-dns-operator";
 
         cloudflare-dns-operator = pkgs.rustPlatform.buildRustPackage {
+          version = "0.1.1";
           pname = name;
-          version = "0.1.0";
 
           cargoHash = "sha256-d2/RG2ZHvxhFkkUQFwJDLwhWjp8E27Hq4Nm9WlqWhY4=";
           src = ./.;
@@ -76,10 +76,11 @@
           packages = with pkgs; [
             rust-analyzer
             (rustfmt.override { asNightly = true; })
+            semver-tool
           ];
 
           RUST_BACKTRACE = "1";
-          RUST_LOG = "debug,hyper_util=info,tower=info,rustls=info,kube=info";
+          RUST_LOG = "debug,cloudflare=trace,hyper_util=info,tower=info,rustls=info,kube=info";
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
 

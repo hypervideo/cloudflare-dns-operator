@@ -1,6 +1,6 @@
 [package]
 name = "cloudflare-dns-operator"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 authors = ["Robert Krahn <robert@shuttle.video>"]
@@ -13,6 +13,7 @@ categories = ["network-programming", "virtualization"]
 readme = "README.md"
 
 [dependencies]
+base64 = "0.22.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 color-eyre = "0.6.3"

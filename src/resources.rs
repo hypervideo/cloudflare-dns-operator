@@ -133,16 +133,39 @@ impl Reference {
     pub async fn lookup(&self, client: &kube::Client, ns: &str) -> eyre::Result<Option<String>> {
         match self {
             Reference::ConfigMap(selector) => {
+                trace!(name = %selector.name, %ns, key = %selector.key, "configmap reference lookup");
                 let config_map = kube::api::Api::<ConfigMap>::namespaced(client.clone(), ns)
                     .get(&selector.name)
                     .await?;
-                Ok(config_map.data.and_then(|data| data.get(&selector.key).cloned()))
+                let value = config_map.data.and_then(|data| data.get(&selector.key).cloned());
+                trace!(value = ?value, "configmap reference lookup result");
+                Ok(value)
             }
             Reference::Secret(selector) => {
+                trace!(name = %selector.name, %ns, key = %selector.key, "secret reference lookup");
                 let secret = kube::api::Api::<Secret>::namespaced(client.clone(), ns)
                     .get(&selector.name)
                     .await?;
-                Ok(secret.string_data.and_then(|data| data.get(&selector.key).cloned()))
+                let result = secret
+                    .string_data
+                    .and_then(|data| data.get(&selector.key).cloned())
+                    .or_else(|| {
+                        secret.data.and_then(|data| {
+                            data.get(&selector.key).and_then(|bytes| {
+                                use base64::prelude::*;
+                                if let Ok(decoded) = String::from_utf8(bytes.0.clone()) {
+                                    trace!("secret reference lookup result string");
+                                    return Some(decoded);
+                                }
+                                if let Some(decoded) = BASE64_STANDARD.decode(&bytes.0).ok().and_then(|decoded| String::from_utf8(decoded).ok()) {
+                                    return Some(decoded);
+                                };
+                                error!(name = %selector.name, %ns, "unable to decode secret reference value as utf8 or base64");
+                                None
+                            })
+                        })
+                    });
+                Ok(result)
             }
         }
     }
