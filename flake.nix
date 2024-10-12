@@ -16,7 +16,7 @@
           version = "0.1.1";
           pname = name;
 
-          cargoHash = "sha256-d2/RG2ZHvxhFkkUQFwJDLwhWjp8E27Hq4Nm9WlqWhY4=";
+          cargoHash = "sha256-GLyxBTZDYaQgBXYRr0ClS5ye4tMPOkT0EfljPSykF5E=";
           src = ./.;
 
           meta = with lib; {
