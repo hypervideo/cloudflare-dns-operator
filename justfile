@@ -1,12 +1,13 @@
 default:
     just --list
 
-install-crds:
+gen-crds:
     cargo run -q -- crds > crds.yaml
+
+install-crds: gen-crds
     kubectl create -f crds.yaml
 
 delete-crds:
-    # kubectl delete crds hyperservers.hyper.video
     kubectl delete -f crds.yaml
 
 run *args="":

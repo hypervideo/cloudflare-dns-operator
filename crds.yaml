@@ -1,0 +1,196 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cloudflarednsrecords.dns.cloudflare.com
+spec:
+  group: dns.cloudflare.com
+  names:
+    categories: []
+    kind: CloudflareDNSRecord
+    plural: cloudflarednsrecords
+    shortNames: []
+    singular: cloudflarednsrecord
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CloudflareDNSRecordSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              apiToken:
+                description: The cloudflare api token to use
+                oneOf:
+                - required:
+                  - value
+                - required:
+                  - from
+                properties:
+                  from:
+                    oneOf:
+                    - required:
+                      - configMap
+                    - required:
+                      - secret
+                    properties:
+                      configMap:
+                        description: Selects a key from a ConfigMap.
+                        properties:
+                          key:
+                            description: The key to select.
+                            type: string
+                          name:
+                            description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                            type: string
+                          optional:
+                            description: Specify whether the ConfigMap or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        - name
+                        type: object
+                      secret:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must be a valid secret key.
+                            type: string
+                          name:
+                            description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        - name
+                        type: object
+                    type: object
+                  value:
+                    type: string
+                type: object
+              comment:
+                description: Arbitrary comment
+                nullable: true
+                type: string
+              content:
+                description: The content of the record
+                oneOf:
+                - required:
+                  - value
+                - required:
+                  - service
+                properties:
+                  service:
+                    properties:
+                      name:
+                        description: Service name
+                        type: string
+                      namespace:
+                        description: Namespace, default is the same namespace as the referent.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  value:
+                    type: string
+                type: object
+              name:
+                description: The name of the record (e.g example.com)
+                type: string
+              proxied:
+                description: Whether the record is proxied by Cloudflare
+                nullable: true
+                type: boolean
+              tags:
+                description: Tags to apply to the record
+                items:
+                  type: string
+                nullable: true
+                type: array
+              ttl:
+                description: TTL in seconds
+                format: int64
+                nullable: true
+                type: integer
+              type:
+                description: The type of the record (e.g A, CNAME, MX, TXT, SRV, LOC, SPF, NS). Defaults to A.
+                enum:
+                - A
+                - AAAA
+                - CNAME
+                - MX
+                - TXT
+                - SRV
+                - LOC
+                - SPF
+                - NS
+                nullable: true
+                type: string
+              zoneId:
+                description: The cloudflare zone ID to create the record in
+                oneOf:
+                - required:
+                  - value
+                - required:
+                  - from
+                properties:
+                  from:
+                    oneOf:
+                    - required:
+                      - configMap
+                    - required:
+                      - secret
+                    properties:
+                      configMap:
+                        description: Selects a key from a ConfigMap.
+                        properties:
+                          key:
+                            description: The key to select.
+                            type: string
+                          name:
+                            description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                            type: string
+                          optional:
+                            description: Specify whether the ConfigMap or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        - name
+                        type: object
+                      secret:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must be a valid secret key.
+                            type: string
+                          name:
+                            description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        - name
+                        type: object
+                    type: object
+                  value:
+                    type: string
+                type: object
+            required:
+            - apiToken
+            - content
+            - name
+            - zoneId
+            type: object
+        required:
+        - spec
+        title: CloudflareDNSRecord
+        type: object
+    served: true
+    storage: true
+    subresources: {}
