@@ -4,12 +4,12 @@ use crate::{
         self,
         Zone,
     },
+    dns_check::DnsCheckRequest,
     resources::{
         CloudflareDNSRecord,
-        StringOrService,
+        CloudflareDNSRecordStatus,
         ZoneNameOrId,
     },
-    services::public_ip_from_service,
 };
 use eyre::{
     Context as _,
@@ -42,20 +42,13 @@ pub async fn update(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState
     let client = &ctx.client;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
+    let is_new = resource.status.is_none();
+
     info!("reconcile request: CloudflareDNSRecord {ns}/{name}");
 
-    let content = match &resource.spec.content {
-        StringOrService::Value(value) => value.clone(),
-        StringOrService::Service(selector) => {
-            let ns = selector.namespace.as_deref().unwrap_or(ns);
-            let name = selector.name.as_str();
-            let record_type = resource.spec.type_;
-            let Some(ip) = public_ip_from_service(client, name, ns, record_type).await? else {
-                error!("no public ip found for service {ns}/{name}");
-                return Ok(());
-            };
-            ip.to_string()
-        }
+    let Some(content) = resource.spec.lookup_content(client, ns).await? else {
+        error!("unable to resolve content for CloudflareDNSRecord {ns}/{name}");
+        return Ok(());
     };
 
     let zone = match &resource.spec.zone {
@@ -98,23 +91,51 @@ pub async fn update(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState
 
     // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-    // We are storing the details about how we created the record in a secret. At deletion time, the configmap / secrets
-    // we got the zone_id and api_token from might be gone already.
-    let mut annotations = resource.metadata.annotations.as_ref().cloned().unwrap_or_default();
-    annotations.insert("dns.cloudflare.com/record_id".to_string(), record.id.clone());
-    annotations.insert("dns.cloudflare.com/zone_id".to_string(), zone_id.clone());
+    let status_key = format!("{ns}:{name}");
 
     let patched = CloudflareDNSRecord {
         metadata: ObjectMeta {
-            annotations: Some(annotations),
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
             ..Default::default()
         },
         spec: resource.spec.clone(),
+        status: Some(CloudflareDNSRecordStatus {
+            // We are storing the details about how we created the record in the
+            // status. At deletion time, the configmap / secrets we got the
+            // zone_id from might be gone already.
+            record_id: record.id,
+            zone_id,
+            pending: if ctx.do_dns_check {
+                !ctx.dns_lookup_success
+                    .lock()
+                    .await
+                    .get(&status_key)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                false
+            },
+        }),
     };
+
+    if is_new && ctx.do_dns_check {
+        let _ = ctx
+            .dns_check_tx
+            .send(DnsCheckRequest::CheckSingleRecord {
+                name: name.to_string(),
+                namespace: ns.to_string(),
+            })
+            .await;
+    }
+
     Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns)
         .patch(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
+        .await
+        .context("unable to patch CloudflareDNSRecord with record details")?;
+
+    Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns)
+        .patch_status(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
         .await
         .context("unable to patch CloudflareDNSRecord with record details")?;
 
@@ -129,22 +150,13 @@ pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerStat
 
     info!("delete request: CloudflareDNSRecord {ns}/{name}");
 
-    let Some(annotations) = resource.metadata.annotations.as_ref() else {
-        error!("missing annotations for CloudflareDNSRecord {ns}/{name}");
+    let Some(status) = resource.status.as_ref() else {
+        error!("missing status for CloudflareDNSRecord {ns}/{name}");
         return Ok(());
     };
 
-    let Some(record_id) = annotations.get("dns.cloudflare.com/record_id") else {
-        error!("missing record_id in annotations for CloudflareDNSRecord {ns}/{name}");
-        return Ok(());
-    };
-
-    let Some(zone_id) = annotations.get("dns.cloudflare.com/zone_id") else {
-        error!("missing zone_id in annotations for CloudflareDNSRecord {ns}/{name}");
-        return Ok(());
-    };
-
-    if let Err(err) = cloudflare::delete_dns_record(zone_id, record_id, &ctx.cloudflare_api_token).await {
+    if let Err(err) = cloudflare::delete_dns_record(&status.zone_id, &status.record_id, &ctx.cloudflare_api_token).await
+    {
         error!("Unable to delete dns record for cloudflare: {err}");
     }
 

@@ -2,18 +2,17 @@
 extern crate tracing;
 
 mod dns;
+mod dns_check;
 mod reconcile;
 mod resources;
 mod services;
 mod state;
 
 use clap::Parser;
+use dns_check::start_dns_check;
 use eyre::Result;
 use futures::StreamExt as _;
-use k8s_openapi::api::core::v1::{
-    Secret,
-    Service,
-};
+use k8s_openapi::api::core::v1::Service;
 use kube::{
     runtime::{
         controller::Action,
@@ -36,6 +35,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -47,8 +47,16 @@ enum Args {
 
 #[derive(Parser)]
 struct ArgsController {
-    #[clap(long, env = "CLOUDFLARE_API_TOKEN")]
+    #[clap(long, env = "CLOUDFLARE_API_TOKEN", help = "Cloudflare API token")]
     cloudflare_api_token: String,
+
+    #[clap(
+        long = "dns-check",
+        env = "CHECK_DNS_RESOLUTION",
+        help = "Do active DNS checks by querying 1.1.1.1? If not set, DNS check is disabled",
+        value_parser = humantime::parse_duration
+    )]
+    dns_checks: Option<Duration>,
 }
 
 #[tokio::main]
@@ -81,31 +89,41 @@ enum Error {
     Unexpected(#[from] eyre::Error),
 }
 
-async fn run_controller(ArgsController { cloudflare_api_token }: ArgsController) -> Result<()> {
+async fn run_controller(
+    ArgsController {
+        cloudflare_api_token,
+        dns_checks,
+    }: ArgsController,
+) -> Result<()> {
     // Load the kubeconfig file.
     let client = kube::Client::try_default().await?;
-    let owned = Api::<resources::CloudflareDNSRecord>::all(client.clone());
-    let secrets = Api::<Secret>::all(client.clone());
+
+    let dns_resources = Api::<resources::CloudflareDNSRecord>::all(client.clone());
 
     info!("Starting controller");
 
-    Controller::new(owned, Default::default())
-        // watch load balancers to adjust dns <-> public ip
+    let (dns_check_tx, dns_check_rx) = mpsc::channel(64);
+
+    let context = Arc::new(ControllerState {
+        client: client.clone(),
+        cloudflare_api_token,
+        do_dns_check: dns_checks.is_some(),
+        dns_check_tx,
+        dns_lookup_success: Default::default(),
+    });
+
+    let dns_change = start_dns_check(context.clone(), dns_check_rx, dns_checks);
+
+    Controller::new(dns_resources, Default::default())
+        // watch load balancers / external ip services to adjust dns <-> public ip
         .watches(
-            Api::<Service>::all(client.clone()),
+            Api::<Service>::all(client),
             watcher::Config::default(),
             is_suitable_service,
         )
-        .owns(secrets, Default::default())
+        .reconcile_on(dns_change)
         .shutdown_on_signal()
-        .run(
-            reconcile,
-            error_policy,
-            Arc::new(ControllerState {
-                client,
-                cloudflare_api_token,
-            }),
-        )
+        .run(reconcile, error_policy, context)
         .for_each(|msg| async move { info!("Reconciled: {:?}", msg) })
         .await;
 

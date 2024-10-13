@@ -193,10 +193,28 @@ spec:
             - name
             - zone
             type: object
+          status:
+            nullable: true
+            properties:
+              pending:
+                description: Whether we are able to resolve the DNS record (false) or not (true)
+                type: boolean
+              record_id:
+                description: The ID of the cloudflare record
+                type: string
+              zone_id:
+                description: The zone ID of the record
+                type: string
+            required:
+            - pending
+            - record_id
+            - zone_id
+            type: object
         required:
         - spec
         title: CloudflareDNSRecord
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

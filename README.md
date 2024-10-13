@@ -10,6 +10,8 @@ In your kubernetes cluster install the [`crds.yaml`](./crds.yaml) file and a dep
 
 This sets up the controller as a deployment. It'll watch for `CloudflareDNSRecord` resources and create/update/delete DNS records in cloudflare.
 
+You can optionally have the controller check the records by doing DNS lookups from 1.1.1.1. The resolution result will be reflected in the `status.pending` field of the `CloudflareDNSRecord` resource. For this to be enabled, set the env var `CHECK_DNS_RESOLUTION` to a human readable duration like `5m` or `1h` or `60s`.
+
 You can then create a new DNS record like this:
 
 ``` yaml
@@ -30,7 +32,7 @@ spec:
     - k8s
 ```
 
-You can also automatically expose LoadBalancer services or external IP services by referencing a service in the `content` instead of a static IP:
+You can also automatically expose IPs from LoadBalancer services or external IP services by referencing a service in the `content` instead of a static IP:
 
 ``` yaml
 # ...

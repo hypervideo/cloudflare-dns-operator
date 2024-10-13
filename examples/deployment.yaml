@@ -48,11 +48,8 @@ kind: ClusterRole
 metadata:
   name: cloudflare-dns-operator-role
 rules:
-- apiGroups: ["", "dns.cloudflare.com"]
+- apiGroups: ["dns.cloudflare.com"]
   resources:
-  - services
-  - configmaps
-  - secrets
   - cloudflarednsrecords
   verbs:
   - get
@@ -62,6 +59,24 @@ rules:
   - delete
   - patch
   - update
+# Access to services to resolve ips. If you don't use dynamic content via
+# referencing services, you can remove this.
+- apiGroups: [""]
+  resources: ["services"]
+  verbs:
+  - get
+  - list
+  - watch
+# Access to configmaps and secrets to read zone names or ids. Remove this if you
+# specify the zone id/name directly.
+- apiGroups: [""]
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
 ---
 
 apiVersion: rbac.authorization.k8s.io/v1

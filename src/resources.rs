@@ -59,6 +59,7 @@ impl std::str::FromStr for RecordType {
     group = "dns.cloudflare.com",
     version = "v1alpha1",
     kind = "CloudflareDNSRecord",
+    status = "CloudflareDNSRecordStatus",
     namespaced
 )]
 pub struct CloudflareDNSRecordSpec {
@@ -79,6 +80,34 @@ pub struct CloudflareDNSRecordSpec {
     pub tags: Option<Vec<String>>,
     /// The cloudflare zone ID to create the record in
     pub zone: ZoneNameOrId,
+}
+
+impl CloudflareDNSRecordSpec {
+    pub async fn lookup_content(&self, client: &kube::Client, ns: &str) -> eyre::Result<Option<String>> {
+        match &self.content {
+            StringOrService::Value(value) => Ok(Some(value.clone())),
+            StringOrService::Service(selector) => {
+                let ns = selector.namespace.as_deref().unwrap_or(ns);
+                let name = selector.name.as_str();
+                let record_type = self.type_;
+                let Some(ip) = crate::services::public_ip_from_service(client, name, ns, record_type).await? else {
+                    error!("no public ip found for service {ns}/{name}");
+                    return Ok(None);
+                };
+                Ok(Some(ip.to_string()))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CloudflareDNSRecordStatus {
+    /// The ID of the cloudflare record
+    pub record_id: String,
+    /// The zone ID of the record
+    pub zone_id: String,
+    /// Whether we are able to resolve the DNS record (false) or not (true)
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

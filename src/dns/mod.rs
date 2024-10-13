@@ -1,3 +1,3 @@
 pub mod cloudflare;
-mod lookup;
+pub mod lookup;
 mod util;
