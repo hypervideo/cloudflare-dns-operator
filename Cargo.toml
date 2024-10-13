@@ -8,7 +8,7 @@ license = "MPL-2.0"
 description = "Kubernetes operator to manage Cloudflare DNS records"
 repository = "https://github.com/hypervideo/cloudflare-dns-operator"
 homepage = "https://github.com/hypervideo/cloudflare-dns-operator"
-keywords = ["cloudflare", "dns", "kubernetes", "operator", "kube-rs", "cloud-native"]
+keywords = ["cloudflare", "dns", "kubernetes", "kube-rs", "cloud-native"]
 categories = ["network-programming", "virtualization"]
 readme = "README.md"
 
