@@ -36,10 +36,17 @@
             ];
 
             packages = with pkgs; [
+              # build
+              just
+              nix-output-monitor
+
+              # dev
+              cargo-nextest
               rust-analyzer
               (rustfmt.override { asNightly = true; })
               semver-tool
-              cargo-nextest
+
+              # release
               cargo-release
               cargo-readme
             ];
