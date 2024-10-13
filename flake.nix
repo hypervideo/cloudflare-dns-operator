@@ -40,6 +40,7 @@
               (rustfmt.override { asNightly = true; })
               semver-tool
               cargo-nextest
+              cargo-release
             ];
 
             RUST_BACKTRACE = "1";
