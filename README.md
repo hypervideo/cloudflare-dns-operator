@@ -1,5 +1,9 @@
 # cloudflare-dns-operator
 
+[![Crates.io](https://img.shields.io/crates/v/cloudflare-dns-operator)](https://crates.io/crates/cloudflare-dns-operator)
+[![](https://docs.rs/cloudflare-dns-operator/badge.svg)](https://docs.rs/cloudflare-dns-operator)
+[![License](https://img.shields.io/crates/l/cloudflare-dns-operator?color=informational&logo=mpl-2)](/LICENSE)
+
 [This is a kubernetes operator](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/) (custom resource definition + kubernetes controller) to manage cloudflare DNS entries from within kubernetes using the cloudflare API.
 
 __Note:__ This is an unofficial project and not affiliated in any way with cloudflare.
