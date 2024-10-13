@@ -1,7 +1,7 @@
 use crate::{
+    context::Context,
     dns::lookup as dns_lookup,
     resources::CloudflareDNSRecord,
-    state::ControllerState,
 };
 use futures::Stream;
 use kube::{
@@ -26,7 +26,7 @@ pub enum DnsCheckRequest {
 }
 
 pub fn start_dns_check(
-    ctx: Arc<ControllerState>,
+    ctx: Arc<Context>,
     mut dns_check_receiver: DnsCheckReceiver,
     check_interval: Option<Duration>,
 ) -> impl Stream<Item = ObjectRef<CloudflareDNSRecord>> + Send + 'static {

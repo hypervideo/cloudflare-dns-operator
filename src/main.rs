@@ -1,15 +1,16 @@
 #[macro_use]
 extern crate tracing;
 
-mod dns;
-mod dns_check;
-mod reconcile;
-mod resources;
-mod services;
-mod state;
-
 use clap::Parser;
-use dns_check::start_dns_check;
+use cloudflare_dns_operator::{
+    context,
+    dns,
+    dns_check,
+    reconcile,
+    resources,
+    services,
+};
+use context::Context;
 use eyre::Result;
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Service;
@@ -25,12 +26,7 @@ use kube::{
     CustomResourceExt as _,
     Resource as _,
 };
-use reconcile::{
-    cleanup,
-    update,
-};
 use services::is_suitable_service;
-use state::ControllerState;
 use std::{
     sync::Arc,
     time::Duration,
@@ -104,7 +100,7 @@ async fn run_controller(
 
     let (dns_check_tx, dns_check_rx) = mpsc::channel(64);
 
-    let context = Arc::new(ControllerState {
+    let context = Arc::new(Context {
         client: client.clone(),
         cloudflare_api_token,
         do_dns_check: dns_checks.is_some(),
@@ -112,7 +108,7 @@ async fn run_controller(
         dns_lookup_success: Default::default(),
     });
 
-    let dns_change = start_dns_check(context.clone(), dns_check_rx, dns_checks);
+    let dns_change = dns_check::start_dns_check(context.clone(), dns_check_rx, dns_checks);
 
     Controller::new(dns_resources, Default::default())
         // watch load balancers / external ip services to adjust dns <-> public ip
@@ -134,17 +130,17 @@ async fn run_controller(
 
 async fn reconcile(
     resource: Arc<resources::CloudflareDNSRecord>,
-    ctx: Arc<ControllerState>,
+    ctx: Arc<Context>,
 ) -> Result<Action, finalizer::Error<Error>> {
     let ns = resource.meta().namespace.as_deref().unwrap_or("default");
     let api: Api<resources::CloudflareDNSRecord> = Api::namespaced(ctx.client.clone(), ns);
 
     finalizer(&api, "dns.cloudflare.com/delete-dns-record", resource, |event| async {
         match event {
-            Event::Apply(server) => update(server, ctx.clone())
+            Event::Apply(server) => reconcile::apply(server, ctx.clone())
                 .await
                 .expect("Failed to update hyper deployment"),
-            Event::Cleanup(server) => cleanup(server, ctx.clone())
+            Event::Cleanup(server) => reconcile::cleanup(server, ctx.clone())
                 .await
                 .expect("Failed to delete hyper deployment"),
         }
@@ -157,7 +153,7 @@ async fn reconcile(
 fn error_policy(
     _object: Arc<resources::CloudflareDNSRecord>,
     err: &finalizer::Error<Error>,
-    _ctx: Arc<ControllerState>,
+    _ctx: Arc<Context>,
 ) -> Action {
     error!("Error reconciling: {:?}", err);
     Action::requeue(Duration::from_secs(15))

@@ -1,5 +1,5 @@
-use super::ControllerState;
 use crate::{
+    context::Context,
     dns::cloudflare::{
         self,
         Zone,
@@ -38,7 +38,7 @@ struct AnnotationContent {
 }
 
 #[instrument(level = "debug", skip_all)]
-pub async fn update(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState>) -> Result<()> {
+pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<()> {
     let client = &ctx.client;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
@@ -144,7 +144,7 @@ pub async fn update(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState
 
 /// This functions runs before the resource is deleted. It'll try to delete the DNS record from Cloudflare.
 #[instrument(level = "debug", skip_all)]
-pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<ControllerState>) -> Result<()> {
+pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<()> {
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
 

@@ -20,7 +20,7 @@ run *args="":
 controller:
     CHECK_DNS_RESOLUTION="30s" just run controller
 
-tests:
+test:
     cargo nextest run
 
 udeps:
