@@ -60,3 +60,4 @@ The zone can also be set with a `secret` or `configMap` reference like this:
 # ...
 ```
 
+See [CloudflareDNSRecordSpec](https://docs.rs/cloudflare-dns-operator/latest/cloudflare_dns_operator/resources/struct.CloudflareDNSRecordSpec.html) for more details.
