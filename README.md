@@ -8,17 +8,22 @@
 
 __Note:__ This is an unofficial project and not affiliated in any way with cloudflare.
 
-## Installation
+### Installation
 
-In your kubernetes cluster install the [`crds.yaml`](./crds.yaml) file and a deployment matching [examples/deployment.yaml](./examples/deployment.yaml). Note that you'll need to set the env var `CLOUDFLARE_API_TOKEN` to a valid cloudflare API token.
+In your kubernetes cluster install the [`crds.yaml`](./crds.yaml) file and a deployment matching
+[examples/deployment.yaml](./examples/deployment.yaml). Note that you'll need to set the env var
+`CLOUDFLARE_API_TOKEN` to a valid cloudflare API token.
 
-This sets up the controller as a deployment. It'll watch for `CloudflareDNSRecord` resources and create/update/delete DNS records in cloudflare.
+This sets up the controller as a deployment. It'll watch for `CloudflareDNSRecord` resources and
+create/update/delete DNS records in cloudflare.
 
-You can optionally have the controller check the records by doing DNS lookups from 1.1.1.1. The resolution result will be reflected in the `status.pending` field of the `CloudflareDNSRecord` resource. For this to be enabled, set the env var `CHECK_DNS_RESOLUTION` to a human readable duration like `5m` or `1h` or `60s`.
+You can optionally have the controller check the records by doing DNS lookups from 1.1.1.1. The resolution result
+will be reflected in the `status.pending` field of the `CloudflareDNSRecord` resource. For this to be enabled, set
+the env var `CHECK_DNS_RESOLUTION` to a human readable duration like `5m` or `1h` or `60s`.
 
 You can then create a new DNS record like this:
 
-``` yaml
+```yaml
 apiVersion: dns.cloudflare.com/v1alpha1
 kind: CloudflareDNSRecord
 metadata:
@@ -36,9 +41,10 @@ spec:
     - k8s
 ```
 
-You can also automatically expose IPs from LoadBalancer services or external IP services by referencing a service in the `content` instead of a static IP:
+You can also automatically expose IPs from LoadBalancer services or external IP services by referencing a service in
+the `content` instead of a static IP:
 
-``` yaml
+```yaml
 # ...
   content:
     service:
@@ -49,7 +55,7 @@ You can also automatically expose IPs from LoadBalancer services or external IP 
 
 The zone can also be set with a `secret` or `configMap` reference like this:
 
-``` yaml
+```yaml
 # ...
   zone:
     name:
@@ -61,3 +67,5 @@ The zone can also be set with a `secret` or `configMap` reference like this:
 ```
 
 See [CloudflareDNSRecordSpec](https://docs.rs/cloudflare-dns-operator/latest/cloudflare_dns_operator/resources/struct.CloudflareDNSRecordSpec.html) for more details.
+
+License: MPL-2.0

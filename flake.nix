@@ -41,6 +41,7 @@
               semver-tool
               cargo-nextest
               cargo-release
+              cargo-readme
             ];
 
             RUST_BACKTRACE = "1";

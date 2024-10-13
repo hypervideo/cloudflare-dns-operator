@@ -27,6 +27,7 @@ udeps:
     CARGO_TARGET_DIR="./target/udeps" nix develop .#nightly -c cargo udeps
 
 release *args="":
+    cargo readme > README.md
     cargo release {{ args }}
 
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
