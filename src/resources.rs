@@ -9,7 +9,9 @@ use serde::{
     Serialize,
 };
 
-/// https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/#dns-record-types
+/// Supported DNS record types.
+///
+/// See https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/#dns-record-types
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, JsonSchema)]
 pub enum RecordType {
@@ -53,7 +55,7 @@ impl std::str::FromStr for RecordType {
     }
 }
 
-// Define the spec of our custom resource
+/// [CustomResource] definition for a Cloudflare DNS record.
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "dns.cloudflare.com",
@@ -67,8 +69,8 @@ pub struct CloudflareDNSRecordSpec {
     pub name: String,
     /// The type of the record (e.g A, CNAME, MX, TXT, SRV, LOC, SPF, NS). Defaults to A.
     #[serde(rename = "type")]
-    pub type_: Option<RecordType>,
-    /// The content of the record
+    pub ty: Option<RecordType>,
+    /// The content of the record such as an IP address or a service reference.
     pub content: StringOrService,
     /// TTL in seconds
     pub ttl: Option<i64>,
@@ -83,13 +85,14 @@ pub struct CloudflareDNSRecordSpec {
 }
 
 impl CloudflareDNSRecordSpec {
+    /// If set directly to a value, return that, otherwise look up the service and return the IP.
     pub async fn lookup_content(&self, client: &kube::Client, ns: &str) -> eyre::Result<Option<String>> {
         match &self.content {
             StringOrService::Value(value) => Ok(Some(value.clone())),
             StringOrService::Service(selector) => {
                 let ns = selector.namespace.as_deref().unwrap_or(ns);
                 let name = selector.name.as_str();
-                let record_type = self.type_;
+                let record_type = self.ty;
                 let Some(ip) = crate::services::public_ip_from_service(client, name, ns, record_type).await? else {
                     error!("no public ip found for service {ns}/{name}");
                     return Ok(None);
@@ -100,16 +103,19 @@ impl CloudflareDNSRecordSpec {
     }
 }
 
+/// Status of a Cloudflare DNS record.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CloudflareDNSRecordStatus {
     /// The ID of the cloudflare record
     pub record_id: String,
     /// The zone ID of the record
     pub zone_id: String,
-    /// Whether we are able to resolve the DNS record (false) or not (true)
+    /// Whether we are able to resolve the DNS record (false) or not (true). If no dns check is performed, this field
+    /// will default to true.
     pub pending: bool,
 }
 
+/// A Cloudflare DNS Zone. Can either be a name (such as example.com) or id.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum ZoneNameOrId {
     #[serde(rename = "name")]
@@ -161,7 +167,7 @@ impl ValueOrReference {
 }
 
 impl Reference {
-    pub async fn lookup(&self, client: &kube::Client, ns: &str) -> eyre::Result<Option<String>> {
+    async fn lookup(&self, client: &kube::Client, ns: &str) -> eyre::Result<Option<String>> {
         match self {
             Reference::ConfigMap(selector) => {
                 trace!(name = %selector.name, %ns, key = %selector.key, "configmap reference lookup");

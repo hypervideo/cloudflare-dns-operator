@@ -13,6 +13,7 @@ use kube::{
     Api,
 };
 use std::{
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
@@ -25,10 +26,13 @@ pub enum DnsCheckRequest {
     CheckSingleRecord { name: String, namespace: String },
 }
 
+/// Try to resolve DNS records of `CloudflareDNSRecord` resources and compare them with the specified content. Will emit
+/// object refs that will trigger resource updates through [`kube::runtime::Controller::reconcile_on`].
 pub fn start_dns_check(
     ctx: Arc<Context>,
     mut dns_check_receiver: DnsCheckReceiver,
     check_interval: Option<Duration>,
+    nameserver: SocketAddr,
 ) -> impl Stream<Item = ObjectRef<CloudflareDNSRecord>> + Send + 'static {
     async_stream::stream! {
         let Some(check_interval) = check_interval else {
@@ -95,9 +99,9 @@ pub fn start_dns_check(
                     continue;
                 };
 
-                let ty = resource.spec.type_.unwrap_or_default();
+                let ty = resource.spec.ty.unwrap_or_default();
 
-                let dns_record_data = match dns_lookup::resolve(qname, ty).await {
+                let dns_record_data = match dns_lookup::resolve(qname, ty,nameserver).await {
                     Ok(Some(it)) => it,
                     Ok(None) => {
                         error!("Unable to resolve unsupported DNS record type: {ty:?} for {key:?}");

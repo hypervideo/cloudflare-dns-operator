@@ -17,8 +17,9 @@ use serde_json::Value;
 // curl 'https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project_name}/deployments' --header 'Authorization: Bearer <API_TOKEN>'
 // c8bba8ee5e5c7b5f8b20bc4d5ca0de58
 
+/// Wraps the cloudflare api response.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ApiResult<T> {
+struct ApiResult<T> {
     errors: Value,
     messages: Value,
     result: T,
@@ -27,7 +28,7 @@ pub struct ApiResult<T> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ApiResultInfo {
+struct ApiResultInfo {
     count: usize,
     page: usize,
     per_page: usize,
@@ -37,6 +38,31 @@ pub struct ApiResultInfo {
 
 // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 // account
+
+/// A cloudflare account that represents a zone.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountInfo {
+    account: Account,
+    id: String,
+    name: String,
+    activated_on: DateTime<Utc>,
+    created_on: DateTime<Utc>,
+    modified_on: Option<DateTime<Utc>>,
+    development_mode: i64,
+    meta: Value,
+    name_servers: Vec<String>,
+    original_dnshost: Option<Value>,
+    original_name_servers: Option<Value>,
+    original_registrar: Option<Value>,
+    owner: Owner,
+    paused: bool,
+    permissions: Vec<String>,
+    plan: Plan,
+    status: String,
+    tenant: Value,
+    tenant_unit: Value,
+    r#type: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Account {
@@ -65,33 +91,11 @@ pub struct Plan {
     price: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountInfo {
-    account: Account,
-    id: String,
-    name: String,
-    activated_on: DateTime<Utc>,
-    created_on: DateTime<Utc>,
-    modified_on: Option<DateTime<Utc>>,
-    development_mode: i64,
-    meta: Value,
-    name_servers: Vec<String>,
-    original_dnshost: Option<Value>,
-    original_name_servers: Option<Value>,
-    original_registrar: Option<Value>,
-    owner: Owner,
-    paused: bool,
-    permissions: Vec<String>,
-    plan: Plan,
-    status: String,
-    tenant: Value,
-    tenant_unit: Value,
-    r#type: String,
-}
-
 // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-/// https://developers.cloudflare.com/api/operations/zones-get?schema_url=https%3A%2F%2Fraw.githubusercontent.com%2Fcloudflare%2Fapi-schemas%2Fmain%2Fopenapi.yaml
+/// A cloudflare dns record.
+///
+/// See https://developers.cloudflare.com/api/operations/zones-get?schema_url=https%3A%2F%2Fraw.githubusercontent.com%2Fcloudflare%2Fapi-schemas%2Fmain%2Fopenapi.yaml
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DnsRecordInfo {
     pub comment: Option<String>,
@@ -122,7 +126,9 @@ pub struct DnsRecordMeta {
     pub managed_by_argo_tunnel: Option<bool>,
 }
 
-/// https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-create-dns-record
+/// Request payload for creating a new dns record.
+///
+/// See https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-create-dns-record.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DnsRecordModification {
     /// <= 32 characters
@@ -141,6 +147,7 @@ pub struct DnsRecordModification {
     pub tags: Option<Vec<String>>,
 }
 
+/// A cloudflare zone. Either the zone name (such as "example.com") or the cloudflare id of it.
 #[derive(Clone, Debug)]
 pub enum Zone {
     Identifier(String),
@@ -172,6 +179,7 @@ impl Zone {
     }
 }
 
+/// Arguments for [`create_dns_record`].
 pub struct CreateRecordArgs {
     pub api_token: String,
     pub zone: Zone,
@@ -182,6 +190,7 @@ pub struct CreateRecordArgs {
     pub ttl: Option<i64>,
 }
 
+/// List all cloudflare accounts which represent zones.
 pub async fn list_zones(api_token: &str) -> Result<Vec<AccountInfo>, eyre::Error> {
     let url = "https://api.cloudflare.com/client/v4/zones";
     request::<Vec<AccountInfo>, ()>(url, None, Method::GET, api_token).await
@@ -227,10 +236,9 @@ pub async fn create_dns_record(args: CreateRecordArgs) -> Result<DnsRecordInfo, 
     .await
 }
 
-/// Updates a cloudflare dns record... currently deletes and recreates... Will
-/// wait for the dns record to propagate, i.e. a dns lookup resolves to the
-/// correct ip.
-/// TODO: we should use the proper patch api.
+/// Updates a cloudflare dns record... currently deletes and recreates... Will wait for the dns record to propagate,
+/// i.e. a dns lookup resolves to the correct ip.
+// TODO: we should use the proper patch api.
 pub async fn update_dns_record_and_wait(args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
     let Some(zone_id) = args.zone.clone().lookup_id(&args.api_token).await? else {
         bail!("zone not found");
@@ -287,6 +295,7 @@ pub async fn delete_dns_record_by_name(
     Ok(())
 }
 
+/// Delete a DNS record by its id using the cloudflare API.
 pub async fn delete_dns_record(
     zone_identifier: impl AsRef<str>,
     id: impl AsRef<str>,
@@ -301,7 +310,7 @@ pub async fn delete_dns_record(
     Ok(())
 }
 
-/// List records in a cloudflare zone
+/// List DNS records in a cloudflare zone.
 pub async fn list_dns_records(
     zone_identifier: impl AsRef<str>,
     api_token: impl AsRef<str>,

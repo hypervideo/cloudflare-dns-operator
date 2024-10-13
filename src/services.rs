@@ -7,6 +7,7 @@ use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector::ObjectRef;
 use std::net::IpAddr;
 
+/// Checks if a [`Service`] resource is suitable for providing a public IP address.
 pub fn is_suitable_service(svc: Service) -> Option<ObjectRef<CloudflareDNSRecord>> {
     let spec = svc.spec.as_ref()?;
     if spec.type_.as_deref() == Some("LoadBalancer") || spec.external_ips.as_ref().map_or(false, |ips| !ips.is_empty())
@@ -19,6 +20,7 @@ pub fn is_suitable_service(svc: Service) -> Option<ObjectRef<CloudflareDNSRecord
     }
 }
 
+/// Extracts the public IP address from a [`Service`] resource.
 pub async fn public_ip_from_service(
     client: &kube::Client,
     name: &str,
@@ -67,6 +69,7 @@ pub async fn public_ip_from_service(
     Ok(None)
 }
 
+/// Selects the most suitable IP address from a list of IPs, given a [hint](RecordType) about the expected record type.
 fn select_ip(ips: Vec<IpAddr>, record_type: Option<RecordType>, name: &str, ns: &str) -> Option<IpAddr> {
     match (&ips[..], record_type) {
         ([], None) => {

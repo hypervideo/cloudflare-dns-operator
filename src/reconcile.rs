@@ -82,7 +82,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         api_token: ctx.cloudflare_api_token.clone(),
         zone,
         name: resource.spec.name.clone(),
-        record_type: resource.spec.type_.unwrap_or_default(),
+        record_type: resource.spec.ty.unwrap_or_default(),
         content,
         comment: resource.spec.comment.clone(),
         ttl: resource.spec.ttl,

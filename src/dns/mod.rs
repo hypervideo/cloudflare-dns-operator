@@ -1,3 +1,3 @@
 pub mod cloudflare;
-pub mod lookup;
+pub(crate) mod lookup;
 mod util;

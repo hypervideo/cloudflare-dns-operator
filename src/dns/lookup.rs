@@ -26,12 +26,14 @@ use std::{
 };
 use tokio::time::sleep;
 
+#[doc(hidden)]
 #[allow(dead_code)]
 pub async fn wait_for_dns_record(
     domain: &str,
     ip: std::net::Ipv4Addr,
     max_wait: Option<Duration>,
     step: Duration,
+    nameserver: SocketAddr,
 ) -> Result<(), eyre::Error> {
     debug!("Waiting for DNS record to propagate...");
     let start = std::time::Instant::now();
@@ -44,7 +46,7 @@ pub async fn wait_for_dns_record(
             }
         }
 
-        if check_dns_record(domain, ip).await? {
+        if check_dns_record(domain, ip, nameserver).await? {
             info!("DNS record for {domain:?} propagated successfully");
             break;
         }
@@ -56,9 +58,14 @@ pub async fn wait_for_dns_record(
     Ok(())
 }
 
-pub async fn check_dns_record(domain: &str, ip: std::net::Ipv4Addr) -> Result<bool, eyre::Error> {
+#[doc(hidden)]
+pub async fn check_dns_record(
+    domain: &str,
+    ip: std::net::Ipv4Addr,
+    nameserver: SocketAddr,
+) -> Result<bool, eyre::Error> {
     debug!(?domain, ?ip, "Checking DNS record...");
-    match get_a_records(domain).await {
+    match get_a_records(domain, nameserver).await {
         Ok(ips) => Ok(ips.contains(&(A { address: ip }))),
         Err(e) => {
             warn!("Failed to resolve DNS record: {e}");
@@ -68,20 +75,17 @@ pub async fn check_dns_record(domain: &str, ip: std::net::Ipv4Addr) -> Result<bo
     }
 }
 
-const CLOUDFLARE_NAMESERVER_IP: &str = "1.1.1.1:53";
-
-async fn get_a_records(qname: &str) -> Result<Vec<A>> {
-    let nameserver: SocketAddr = CLOUDFLARE_NAMESERVER_IP.parse()?;
+async fn get_a_records(qname: &str, nameserver: SocketAddr) -> Result<Vec<A>> {
     let config = ClientConfig::with_nameserver(nameserver);
     let mut client = Client::new(config).await?;
     let rrset = client.query_rrset::<A>(qname, Class::IN).await?;
     Ok(rrset.rdata)
 }
 
-pub async fn resolve(qname: &str, ty: RecordType) -> rsdns::Result<Option<Vec<String>>> {
+/// Resolve a DNS record using the specified nameserver. Will stringify the result according to [RFC 1035](https://datatracker.ietf.org/doc/html/rfc1035).
+pub async fn resolve(qname: &str, ty: RecordType, nameserver: SocketAddr) -> rsdns::Result<Option<Vec<String>>> {
     debug!(?qname, ?ty, "DNS record lookup...");
 
-    let nameserver: SocketAddr = CLOUDFLARE_NAMESERVER_IP.parse().expect("Invalid nameserver IP");
     let config = ClientConfig::with_nameserver(nameserver);
     let mut client = Client::new(config).await?;
 

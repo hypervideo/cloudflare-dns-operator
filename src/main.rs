@@ -28,6 +28,7 @@ use kube::{
 };
 use services::is_suitable_service;
 use std::{
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
@@ -53,6 +54,14 @@ struct ArgsController {
         value_parser = humantime::parse_duration
     )]
     dns_checks: Option<Duration>,
+
+    #[clap(
+        long,
+        env = "NAMESERVER_FOR_DNS_CHECK",
+        help = "Nameserver and port to use for DNS checks",
+        default_value = "1.1.1.1:53"
+    )]
+    nameserver: SocketAddr,
 }
 
 #[tokio::main]
@@ -89,14 +98,12 @@ async fn run_controller(
     ArgsController {
         cloudflare_api_token,
         dns_checks,
+        nameserver,
     }: ArgsController,
 ) -> Result<()> {
-    // Load the kubeconfig file.
     let client = kube::Client::try_default().await?;
 
     let dns_resources = Api::<resources::CloudflareDNSRecord>::all(client.clone());
-
-    info!("Starting controller");
 
     let (dns_check_tx, dns_check_rx) = mpsc::channel(64);
 
@@ -108,7 +115,9 @@ async fn run_controller(
         dns_lookup_success: Default::default(),
     });
 
-    let dns_change = dns_check::start_dns_check(context.clone(), dns_check_rx, dns_checks);
+    let dns_change = dns_check::start_dns_check(context.clone(), dns_check_rx, dns_checks, nameserver);
+
+    info!("Starting controller");
 
     Controller::new(dns_resources, Default::default())
         // watch load balancers / external ip services to adjust dns <-> public ip
