@@ -22,7 +22,7 @@ spec:
       serviceAccountName: cloudflare-dns-operator
       containers:
       - name: cloudflare-dns-operator
-        image: robertkrahn/cloudflare-dns-operator:0.1.1
+        image: robertkrahn/cloudflare-dns-operator:latest
         imagePullPolicy: Always
         env:
         - name: RUST_LOG
@@ -34,6 +34,11 @@ spec:
             secretKeyRef:
               name: cloudflare-api-token
               key: api-token
+        # optional
+        - name: CHECK_DNS_RESOLUTION
+          value: "5m"
+        - name: NAMESERVER_FOR_DNS_CHECK
+          value: "1.1.1.1:53"
 ---
 
 apiVersion: v1
