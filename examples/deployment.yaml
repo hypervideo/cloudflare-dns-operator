@@ -51,6 +51,7 @@ rules:
 - apiGroups: ["dns.cloudflare.com"]
   resources:
   - cloudflarednsrecords
+  - cloudflarednsrecords/status
   verbs:
   - get
   - list
