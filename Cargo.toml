@@ -4,7 +4,7 @@ version = "0.1.3"
 edition = "2021"
 
 authors = ["Robert Krahn <robert@shuttle.video>"]
-license = "TBD"
+license = "MPL-2.0"
 description = "Kubernetes operator to manage Cloudflare DNS records"
 repository = "https://github.com/hypervideo/cloudflare-dns-operator"
 homepage = "https://github.com/hypervideo/cloudflare-dns-operator"
