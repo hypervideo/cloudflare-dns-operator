@@ -26,6 +26,9 @@ test:
 udeps:
     CARGO_TARGET_DIR="./target/udeps" nix develop .#nightly -c cargo udeps
 
+release *args="":
+    cargo release {{ args }}
+
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 IMAGE_NAME := "cloudflare-dns-operator"
