@@ -6,7 +6,10 @@ use cloudflare_dns_operator::{
     context,
     dns,
     dns_check,
-    reconcile,
+    reconcile::{
+        self,
+        ReconcileError,
+    },
     resources,
     services,
 };
@@ -86,21 +89,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(thiserror::Error, Debug)]
-enum Error {
-    #[error("Failed to create CRD: {0}")]
-    Crd(#[from] kube::Error),
-    #[error("Unexpected error: {0}")]
-    Unexpected(#[from] eyre::Error),
-}
-
 async fn run_controller(
     ArgsController {
         cloudflare_api_token,
         dns_checks,
         nameserver,
     }: ArgsController,
-) -> Result<()> {
+) -> Result<(), ReconcileError> {
     let client = kube::Client::try_default().await?;
 
     let dns_resources = Api::<resources::CloudflareDNSRecord>::all(client.clone());
@@ -140,18 +135,31 @@ async fn run_controller(
 async fn reconcile(
     resource: Arc<resources::CloudflareDNSRecord>,
     ctx: Arc<Context>,
-) -> Result<Action, finalizer::Error<Error>> {
+) -> Result<Action, finalizer::Error<ReconcileError>> {
     let ns = resource.meta().namespace.as_deref().unwrap_or("default");
     let api: Api<resources::CloudflareDNSRecord> = Api::namespaced(ctx.client.clone(), ns);
 
     finalizer(&api, "dns.cloudflare.com/delete-dns-record", resource, |event| async {
-        match event {
-            Event::Apply(server) => reconcile::apply(server, ctx.clone())
-                .await
-                .expect("Failed to update hyper deployment"),
-            Event::Cleanup(server) => reconcile::cleanup(server, ctx.clone())
-                .await
-                .expect("Failed to delete hyper deployment"),
+        let result = match event {
+            Event::Apply(server) => reconcile::apply(server, ctx.clone()).await,
+            Event::Cleanup(server) => reconcile::cleanup(server, ctx.clone()).await,
+        };
+
+        if let Err(err) = result {
+            match err {
+                reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 409 => {
+                    warn!("Conflict when reconciling object: {err}");
+                }
+                reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 404 => {
+                    warn!("Object not found when reconciling object: {err}");
+                }
+                reconcile::ReconcileError::Deletion(err) => {
+                    error!("Failed to delete object: {err:?}");
+                }
+                err => {
+                    return Err(err);
+                }
+            }
         }
 
         Ok(Action::requeue(Duration::from_secs(60)))
@@ -161,7 +169,7 @@ async fn reconcile(
 
 fn error_policy(
     _object: Arc<resources::CloudflareDNSRecord>,
-    err: &finalizer::Error<Error>,
+    err: &finalizer::Error<ReconcileError>,
     _ctx: Arc<Context>,
 ) -> Action {
     error!("Error reconciling: {:?}", err);

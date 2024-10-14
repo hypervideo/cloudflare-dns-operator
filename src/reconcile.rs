@@ -18,7 +18,6 @@ use crate::{
 use eyre::{
     Context as _,
     OptionExt as _,
-    Result,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{
@@ -36,6 +35,18 @@ use serde::{
 };
 use std::sync::Arc;
 
+#[derive(thiserror::Error, Debug)]
+pub enum ReconcileError {
+    #[error(transparent)]
+    Kube(#[from] kube::Error),
+
+    #[error(transparent)]
+    Deletion(#[from] wait::delete::Error),
+
+    #[error(transparent)]
+    Other(#[from] eyre::Error),
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AnnotationContent {
     record_id: String,
@@ -43,7 +54,7 @@ struct AnnotationContent {
     zone_id: String,
 }
 
-pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<()> {
+pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<(), ReconcileError> {
     let client = &ctx.client;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
@@ -188,7 +199,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
 
 /// This functions runs before the resource is deleted. It'll try to delete the DNS record from Cloudflare.
 #[instrument(level = "debug", skip_all)]
-pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<()> {
+pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<(), ReconcileError> {
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
 
@@ -211,7 +222,7 @@ pub async fn update_conditions(
     resource: &CloudflareDNSRecord,
     ctx: &Context,
     conditions: Vec<Condition>,
-) -> Result<()> {
+) -> Result<(), ReconcileError> {
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let status = resource.status.clone().unwrap_or_default();
