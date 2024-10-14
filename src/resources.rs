@@ -13,7 +13,7 @@ use serde::{
 ///
 /// See https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/#dns-record-types
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, JsonSchema)]
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize, Clone, Copy, JsonSchema)]
 pub enum RecordType {
     #[default]
     #[serde(rename = "A")]
@@ -56,7 +56,7 @@ impl std::str::FromStr for RecordType {
 }
 
 /// [CustomResource] definition for a Cloudflare DNS record.
-#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "dns.cloudflare.com",
     version = "v1alpha1",
