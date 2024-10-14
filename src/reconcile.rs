@@ -27,6 +27,7 @@ use kube::{
         Patch,
         PatchParams,
     },
+    runtime::wait,
     Api,
 };
 use serde::{
@@ -42,7 +43,6 @@ struct AnnotationContent {
     zone_id: String,
 }
 
-#[instrument(level = "debug", skip_all)]
 pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<()> {
     let client = &ctx.client;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
@@ -50,7 +50,19 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
     let is_new = resource.status.is_none();
     let gen = resource.metadata.generation;
 
-    info!("reconcile request: CloudflareDNSRecord {ns}/{name}");
+    info!("processing reconcile request");
+
+    // If a record exists with a different name, we need to delete it first.
+    let domain_or_record_text = resource.spec.name.as_str();
+    let api = Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns);
+    if let Some(existing) = api.get_opt(name).await? {
+        if existing.spec.name != domain_or_record_text {
+            warn!(
+                "conflict: CloudflareDNSRecord {ns}/{name} already exists with a different name, deleting old record"
+            );
+            wait::delete::delete_and_finalize(api, name, &Default::default()).await?;
+        }
+    }
 
     let Some(content) = resource.spec.lookup_content(client, ns).await? else {
         let msg = format!("unable to resolve content for CloudflareDNSRecord {ns}/{name}");
@@ -104,7 +116,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
     let record = cloudflare::update_dns_record_and_wait(cloudflare::CreateRecordArgs {
         api_token: ctx.cloudflare_api_token.clone(),
         zone,
-        name: resource.spec.name.clone(),
+        name: domain_or_record_text.to_string(),
         record_type: resource.spec.ty.unwrap_or_default(),
         content,
         comment: resource.spec.comment.clone(),

@@ -59,8 +59,7 @@ pub fn start_dns_check(
                     match request {
                         DnsCheckRequest::CheckSingleRecord { name, namespace } => {
                             trace!("Request to check single DNS record {}/{}", namespace, name);
-                            let api = Api::<CloudflareDNSRecord>::namespaced(client.clone(), &namespace);
-                            match api.get(&name).await {
+                            match Api::<CloudflareDNSRecord>::namespaced(client.clone(), &namespace).get(&name).await {
                                 Ok(resource) => vec![resource],
                                 Err(err) => {
                                     error!("Failed to get CloudflareDNSRecord {}/{}: {}", namespace, name, err);
@@ -109,7 +108,7 @@ pub fn start_dns_check(
                     }
                     Err(err) => {
                         error!("Failed to resolve DNS record: {err:?} for {key:?}");
-                        continue;
+                        Vec::new()
                     }
                 };
 
@@ -123,6 +122,13 @@ pub fn start_dns_check(
                 dns_lookup_success.insert(key, matches);
 
                 if changed {
+                    let gen = resource.metadata.generation;
+                    let msg = format!("DNS record mismatch: expected {:?}, got {:?}. Nameserver: {}", content, dns_record_data, nameserver);
+                    let _= crate::reconcile::update_conditions(
+                        &resource,
+                        &ctx,
+                        vec![crate::conditions::error_condition(&resource, "dns record mismatch", msg, gen)],
+                    ).await;
                     yield resource.to_object_ref(());
                 }
             }

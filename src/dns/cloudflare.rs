@@ -262,6 +262,8 @@ pub async fn update_dns_record_and_wait(args: CreateRecordArgs) -> Result<DnsRec
             .context("Failed to delete existing DNS record")?;
     }
 
+    info!("Creating new DNS record for {domain:?} with {:?}", args.content);
+
     let record = create_dns_record(args).await?;
 
     debug!("Registered record for {domain:?} with {:?}", record.content);
