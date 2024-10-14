@@ -128,6 +128,23 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
 
     let status_key = format!("{ns}:{name}");
 
+    let pending = if ctx.do_dns_check {
+        !ctx.dns_lookup_success
+            .lock()
+            .await
+            .get(&status_key)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        false
+    };
+    let condition = if !pending {
+        success_condition(&resource, gen)
+    } else {
+        let msg = "The DNS record has not propagated yet. This is expected to take some time.".to_string();
+        error_condition(&resource, "pending", msg, gen)
+    };
+
     let patched = CloudflareDNSRecord {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -141,17 +158,8 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
             // zone_id from might be gone already.
             record_id: record.id,
             zone_id,
-            pending: if ctx.do_dns_check {
-                !ctx.dns_lookup_success
-                    .lock()
-                    .await
-                    .get(&status_key)
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                false
-            },
-            conditions: Some(vec![success_condition(&resource, gen)]),
+            pending,
+            conditions: Some(vec![condition]),
         }),
     };
 
