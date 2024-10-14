@@ -122,13 +122,6 @@ pub fn start_dns_check(
                 dns_lookup_success.insert(key, matches);
 
                 if changed {
-                    let gen = resource.metadata.generation;
-                    let msg = format!("DNS record mismatch: expected {:?}, got {:?}. Nameserver: {}", content, dns_record_data, nameserver);
-                    let _= crate::reconcile::update_conditions(
-                        &resource,
-                        &ctx,
-                        vec![crate::conditions::error_condition(&resource, "dns record mismatch", msg, gen)],
-                    ).await;
                     yield resource.to_object_ref(());
                 }
             }
