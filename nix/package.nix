@@ -4,7 +4,7 @@
 }:
 
 rustPlatform.buildRustPackage {
-  version = "0.1.5";
+  version = "0.1.6";
   pname = name;
 
   cargoHash = "sha256-KA6w4Ii9bSjUOjZLH7Mxwf4mZgv2FC5EcWnc3hURd04=";
