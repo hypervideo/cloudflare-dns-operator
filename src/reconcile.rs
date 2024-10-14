@@ -1,3 +1,7 @@
+use super::conditions::{
+    error_condition,
+    success_condition,
+};
 use crate::{
     context::Context,
     dns::cloudflare::{
@@ -16,6 +20,7 @@ use eyre::{
     OptionExt as _,
     Result,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{
     api::{
         ObjectMeta,
@@ -43,33 +48,51 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
     let is_new = resource.status.is_none();
+    let gen = resource.metadata.generation;
 
     info!("reconcile request: CloudflareDNSRecord {ns}/{name}");
 
     let Some(content) = resource.spec.lookup_content(client, ns).await? else {
-        error!("unable to resolve content for CloudflareDNSRecord {ns}/{name}");
+        let msg = format!("unable to resolve content for CloudflareDNSRecord {ns}/{name}");
+        error!("{msg}");
+        update_conditions(
+            &resource,
+            &ctx,
+            vec![error_condition(&resource, "missing content", msg, gen)],
+        )
+        .await?;
         return Ok(());
     };
 
     let zone = match &resource.spec.zone {
-        ZoneNameOrId::Name(it) => {
-            let Some(name) = it.lookup(client, ns).await? else {
-                error!("unable to resolve {it:?} for CloudflareDNSRecord {ns}/{name}");
-                return Ok(());
-            };
-            Zone::name(name)
-        }
-        ZoneNameOrId::Id(it) => {
-            let Some(id) = it.lookup(client, ns).await? else {
-                error!("unable to resolve {it:?} for CloudflareDNSRecord {ns}/{name}");
-                return Ok(());
-            };
-            Zone::id(id)
-        }
+        ZoneNameOrId::Name(it) => it.lookup(client, ns).await?.map(Zone::name),
+        ZoneNameOrId::Id(it) => it.lookup(client, ns).await?.map(Zone::id),
+    };
+
+    let Some(zone) = zone else {
+        let msg = format!(
+            "unable to resolve {:?} for CloudflareDNSRecord {ns}/{name}",
+            resource.spec.zone
+        );
+        error!("{msg}");
+        update_conditions(
+            &resource,
+            &ctx,
+            vec![error_condition(&resource, "missing zone", msg, gen)],
+        )
+        .await?;
+        return Ok(());
     };
 
     let Some(zone) = zone.resolve(&ctx.cloudflare_api_token).await? else {
-        error!("unable to resolve zone for CloudflareDNSRecord {ns}/{name}");
+        let msg = format!("unable to resolve zone for CloudflareDNSRecord {ns}/{name}");
+        error!("{msg}");
+        update_conditions(
+            &resource,
+            &ctx,
+            vec![error_condition(&resource, "missing zone", msg, gen)],
+        )
+        .await?;
         return Ok(());
     };
     let Zone::Identifier(zone_id) = zone.clone() else {
@@ -116,6 +139,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
             } else {
                 false
             },
+            conditions: Some(vec![success_condition(&resource, gen)]),
         }),
     };
 
@@ -159,6 +183,36 @@ pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> R
     {
         error!("Unable to delete dns record for cloudflare: {err}");
     }
+
+    Ok(())
+}
+
+pub async fn update_conditions(
+    resource: &CloudflareDNSRecord,
+    ctx: &Context,
+    conditions: Vec<Condition>,
+) -> Result<()> {
+    let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
+    let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
+    let status = resource.status.clone().unwrap_or_default();
+
+    let patched = CloudflareDNSRecord {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            ..Default::default()
+        },
+        spec: resource.spec.clone(),
+        status: Some(CloudflareDNSRecordStatus {
+            conditions: Some(conditions),
+            ..status
+        }),
+    };
+
+    Api::<CloudflareDNSRecord>::namespaced(ctx.client.clone(), ns)
+        .patch_status(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
+        .await
+        .context("unable to patch CloudflareDNSRecord with record details")?;
 
     Ok(())
 }

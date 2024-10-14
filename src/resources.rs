@@ -1,6 +1,9 @@
-use k8s_openapi::api::core::v1::{
-    ConfigMap,
-    Secret,
+use k8s_openapi::{
+    api::core::v1::{
+        ConfigMap,
+        Secret,
+    },
+    apimachinery::pkg::apis::meta::v1::Condition,
 };
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -113,6 +116,8 @@ pub struct CloudflareDNSRecordStatus {
     /// Whether we are able to resolve the DNS record (false) or not (true). If no dns check is performed, this field
     /// will default to true.
     pub pending: bool,
+    /// Status conditions
+    pub conditions: Option<Vec<Condition>>,
 }
 
 /// A Cloudflare DNS Zone. Can either be a name (such as example.com) or id.

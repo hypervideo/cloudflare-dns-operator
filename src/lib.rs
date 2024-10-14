@@ -69,6 +69,7 @@
 #[macro_use]
 extern crate tracing;
 
+pub mod conditions;
 pub mod context;
 pub mod dns;
 pub mod dns_check;
