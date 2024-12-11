@@ -3,7 +3,7 @@ name = "cloudflare-dns-operator"
 version = "0.1.9"
 edition = "2021"
 
-authors = ["Robert Krahn <robert@shuttle.video>"]
+authors = ["Robert Krahn <robert@hyper.video>"]
 license = "MPL-2.0"
 description = "Kubernetes operator to manage Cloudflare DNS records"
 repository = "https://github.com/hypervideo/cloudflare-dns-operator"

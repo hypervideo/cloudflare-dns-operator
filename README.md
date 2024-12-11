@@ -32,7 +32,8 @@ spec:
   name: foo.example.com
   type: A
   ttl: 3600
-  content: "1.2.3.4"
+  content:
+    value: "1.2.3.4"
   zone:
     name:
       value: example.com
