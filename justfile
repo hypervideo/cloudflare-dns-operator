@@ -32,6 +32,13 @@ release *args="":
 
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
+example:
+    KUBECONFIG=/home/robert/projects/shuttle/infra/tf/hcloud-eu-central-dev-2/kubeconfig.yaml \
+      RUST_LOG=debug \
+      cargo run --example external-ip
+
+# -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
 IMAGE_NAME := "cloudflare-dns-operator"
 DOCKER_REGISTRY := "robertkrahn"
 
