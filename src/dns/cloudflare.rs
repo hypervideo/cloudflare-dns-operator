@@ -112,8 +112,6 @@ pub struct DnsRecordInfo {
     pub ttl: i64,
     #[serde(rename = "type")]
     pub record_type: String,
-    pub zone_id: String,
-    pub zone_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,7 +191,7 @@ pub struct CreateRecordArgs {
 /// List all cloudflare accounts which represent zones.
 pub async fn list_zones(api_token: &str) -> Result<Vec<AccountInfo>, eyre::Error> {
     let url = "https://api.cloudflare.com/client/v4/zones";
-    request::<Vec<AccountInfo>, ()>(url, None, Method::GET, api_token).await
+    cloudflare_api_request::<Vec<AccountInfo>, ()>(url, None, Method::GET, api_token).await
 }
 
 /// Create a new cloudflare dns record
@@ -218,7 +216,7 @@ pub async fn create_dns_record(args: CreateRecordArgs) -> Result<DnsRecordInfo, 
 
     info!(?id, ?name, r#type = ?record_type, "creating dns record");
 
-    request::<DnsRecordInfo, _>(
+    cloudflare_api_request::<DnsRecordInfo, _>(
         &url,
         Some(DnsRecordModification {
             id,
@@ -307,7 +305,7 @@ pub async fn delete_dns_record(
     let id = id.as_ref();
     let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records/{id}");
 
-    request::<Value, ()>(&url, None, Method::DELETE, api_token).await?;
+    cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, api_token).await?;
 
     Ok(())
 }
@@ -319,10 +317,15 @@ pub async fn list_dns_records(
 ) -> Result<Vec<DnsRecordInfo>> {
     let zone_identifier = zone_identifier.as_ref();
     let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
-    request::<Vec<DnsRecordInfo>, ()>(&url, None, Method::GET, api_token).await
+    cloudflare_api_request::<Vec<DnsRecordInfo>, ()>(&url, None, Method::GET, api_token).await
 }
 
-async fn request<R, B>(url: &str, body: Option<B>, method: Method, api_token: impl AsRef<str>) -> Result<R>
+pub async fn cloudflare_api_request<R, B>(
+    url: &str,
+    body: Option<B>,
+    method: Method,
+    api_token: impl AsRef<str>,
+) -> Result<R>
 where
     B: Serialize,
     R: DeserializeOwned,
