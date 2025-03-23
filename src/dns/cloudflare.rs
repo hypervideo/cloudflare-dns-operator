@@ -122,6 +122,19 @@ pub struct DnsRecordInfo {
     pub record_type: String,
 }
 
+impl std::fmt::Display for DnsRecordInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{name} {record_type} {content} ttl={ttl}",
+            name = self.name,
+            record_type = self.record_type,
+            content = self.content,
+            ttl = self.ttl
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRecordMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,6 +199,7 @@ impl Zone {
 }
 
 /// Arguments for [`create_dns_record`].
+#[derive(Debug)]
 pub struct CreateRecordArgs {
     pub zone: Zone,
     pub name: String,
@@ -255,6 +269,11 @@ impl CloudflareApi {
             cloudflare_api_request::<Vec<DnsRecordInfo>, ()>(&url, None, Method::GET, &self.api_token).await?;
         cache.insert(zone_identifier.to_string(), (Utc::now(), records.clone()));
 
+        info!("Found the following records:");
+        for record in &records {
+            info!(%record);
+        }
+
         Ok(records)
     }
 
@@ -302,6 +321,7 @@ impl CloudflareApi {
     /// Updates a cloudflare dns record... currently deletes and recreates... Will wait for the dns record to propagate,
     /// i.e. a dns lookup resolves to the correct ip.
     // TODO: we should use the proper patch api.
+    #[instrument(level = "debug", skip(self))]
     pub async fn update_dns_record_and_wait(&self, args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
         let Some(zone_id) = args.zone.clone().lookup_id(self).await? else {
             bail!("zone not found");
