@@ -328,19 +328,25 @@ impl CloudflareApi {
         let domain = args.name.clone();
         let dns_records = self.list_dns_records(&zone_id).await?;
 
-        if let Some(existing) = dns_records.into_iter().find(|record| record.name == domain) {
-            if existing.content == args.content {
+        let mut existing = None;
+        for record in dns_records.into_iter().filter(|record| record.name == domain) {
+            if record.content == args.content {
+                existing = Some(record);
                 info!("DNS record for {domain:?} already exists with {:?}", args.content);
-                return Ok(existing);
+                continue;
             }
 
             warn!(
                 "Found existing DNS record for web domain {domain:?} with ip {:?}. Deleting.",
-                existing.content
+                record.content
             );
-            self.delete_dns_record(&zone_id, &existing.id)
+            self.delete_dns_record(&zone_id, &record.id)
                 .await
                 .context("Failed to delete existing DNS record")?;
+        }
+
+        if let Some(existing) = existing {
+            return Ok(existing);
         }
 
         info!("Creating new DNS record for {domain:?} with {:?}", args.content);
