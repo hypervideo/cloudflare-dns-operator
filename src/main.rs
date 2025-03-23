@@ -4,7 +4,7 @@ extern crate tracing;
 use clap::Parser;
 use cloudflare_dns_operator::{
     context,
-    dns,
+    dns::cloudflare::CloudflareApi,
     dns_check,
     reconcile::{
         self,
@@ -81,7 +81,8 @@ async fn main() -> Result<()> {
             run_controller(args).await?;
         }
         Args::ListZones(args) => {
-            let zones = dns::cloudflare::list_zones(&args.cloudflare_api_token).await?;
+            let cloudflare_api = CloudflareApi::new(args.cloudflare_api_token);
+            let zones = cloudflare_api.list_zones().await?;
             dbg!(zones);
         }
     }
@@ -102,9 +103,11 @@ async fn run_controller(
 
     let (dns_check_tx, dns_check_rx) = mpsc::channel(64);
 
+    let cloudflare_api = CloudflareApi::new(cloudflare_api_token);
+
     let context = Arc::new(Context {
         client: client.clone(),
-        cloudflare_api_token,
+        cloudflare_api,
         do_dns_check: dns_checks.is_some(),
         dns_check_tx,
         dns_lookup_success: Default::default(),
@@ -173,5 +176,14 @@ fn error_policy(
     _ctx: Arc<Context>,
 ) -> Action {
     error!("Error reconciling: {:?}", err);
-    Action::requeue(Duration::from_secs(15))
+
+    let is_rate_limit = match err {
+        finalizer::Error::CleanupFailed(ReconcileError::Other(report))
+        | finalizer::Error::ApplyFailed(ReconcileError::Other(report)) => {
+            report.to_string().contains("cloudflare api error") && report.to_string().contains("429")
+        }
+        _ => false,
+    };
+
+    Action::requeue(Duration::from_secs(if is_rate_limit { 5 * 60 } else { 60 }))
 }

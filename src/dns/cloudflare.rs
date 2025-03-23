@@ -1,6 +1,9 @@
 use super::util;
 use crate::resources::RecordType;
-use chrono::prelude::*;
+use chrono::{
+    prelude::*,
+    Duration,
+};
 use eyre::{
     bail,
     Context as _,
@@ -13,6 +16,11 @@ use serde::{
     Serialize,
 };
 use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
+use tokio::sync::Mutex;
 
 // curl 'https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project_name}/deployments' --header 'Authorization: Bearer <API_TOKEN>'
 // c8bba8ee5e5c7b5f8b20bc4d5ca0de58
@@ -40,7 +48,7 @@ struct ApiResultInfo {
 // account
 
 /// A cloudflare account that represents a zone.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountInfo {
     account: Account,
     id: String,
@@ -64,20 +72,20 @@ pub struct AccountInfo {
     r#type: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     id: String,
     name: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Owner {
     email: Option<String>,
     id: Option<String>,
     r#type: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     can_subscribe: bool,
     currency: String,
@@ -96,7 +104,7 @@ pub struct Plan {
 /// A cloudflare dns record.
 ///
 /// See https://developers.cloudflare.com/api/operations/zones-get?schema_url=https%3A%2F%2Fraw.githubusercontent.com%2Fcloudflare%2Fapi-schemas%2Fmain%2Fopenapi.yaml
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRecordInfo {
     pub comment: Option<String>,
     pub content: String,
@@ -114,7 +122,20 @@ pub struct DnsRecordInfo {
     pub record_type: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl std::fmt::Display for DnsRecordInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{name} {record_type} {content} ttl={ttl}",
+            name = self.name,
+            record_type = self.record_type,
+            content = self.content,
+            ttl = self.ttl
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRecordMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_added: Option<bool>,
@@ -127,7 +148,7 @@ pub struct DnsRecordMeta {
 /// Request payload for creating a new dns record.
 ///
 /// See https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-create-dns-record.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRecordModification {
     /// <= 32 characters
     pub id: String,
@@ -161,16 +182,16 @@ impl Zone {
         Zone::Name(name.to_string())
     }
 
-    pub async fn resolve(self, api_token: &str) -> Result<Option<Self>> {
-        self.lookup_id(api_token).await.map(|id| id.map(Zone::Identifier))
+    pub async fn resolve(self, api: &CloudflareApi) -> Result<Option<Self>> {
+        self.lookup_id(api).await.map(|id| id.map(Zone::Identifier))
     }
 
-    pub async fn lookup_id(self, api_token: &str) -> Result<Option<String>> {
+    pub async fn lookup_id(self, api: &CloudflareApi) -> Result<Option<String>> {
         match self {
             Zone::Identifier(id) => Ok(Some(id)),
             Zone::Name(name) => {
                 debug!(?name, "looking up zone by name");
-                let accounts = list_zones(api_token).await?;
+                let accounts = api.list_zones().await?;
                 Ok(accounts.into_iter().find(|it| it.name == name).map(|it| it.id))
             }
         }
@@ -178,8 +199,8 @@ impl Zone {
 }
 
 /// Arguments for [`create_dns_record`].
+#[derive(Debug)]
 pub struct CreateRecordArgs {
-    pub api_token: String,
     pub zone: Zone,
     pub name: String,
     pub record_type: RecordType,
@@ -188,136 +209,231 @@ pub struct CreateRecordArgs {
     pub ttl: Option<i64>,
 }
 
-/// List all cloudflare accounts which represent zones.
-pub async fn list_zones(api_token: &str) -> Result<Vec<AccountInfo>, eyre::Error> {
-    let url = "https://api.cloudflare.com/client/v4/zones";
-    cloudflare_api_request::<Vec<AccountInfo>, ()>(url, None, Method::GET, api_token).await
+#[allow(clippy::type_complexity)]
+#[derive(Clone, Debug)]
+pub struct CloudflareApi {
+    api_token: String,
+    list_zone_cache: Arc<Mutex<Option<(DateTime<Utc>, Vec<AccountInfo>)>>>,
+    list_dns_records_cache: Arc<Mutex<HashMap<String, (DateTime<Utc>, Vec<DnsRecordInfo>)>>>,
 }
 
-/// Create a new cloudflare dns record
-pub async fn create_dns_record(args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
-    let CreateRecordArgs {
-        api_token,
-        zone,
-        name,
-        record_type,
-        content,
-        comment,
-        ttl,
-    } = args;
+impl CloudflareApi {
+    pub fn new(api_token: String) -> Self {
+        Self {
+            api_token,
+            list_zone_cache: Default::default(),
+            list_dns_records_cache: Default::default(),
+        }
+    }
 
-    let zone_identifier = zone
-        .lookup_id(&api_token)
-        .await?
-        .ok_or_else(|| eyre::eyre!("zone not found"))?;
+    async fn invalidate_dns_record_cache(&self, zone_identifier: impl AsRef<str>) {
+        self.list_dns_records_cache
+            .lock()
+            .await
+            .remove(zone_identifier.as_ref());
+    }
 
-    let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
-    let id = util::id();
+    /// List all cloudflare accounts which represent zones.
+    pub async fn list_zones(&self) -> Result<Vec<AccountInfo>, eyre::Error> {
+        const CACHE_DURATION: Duration = Duration::minutes(5);
 
-    info!(?id, ?name, r#type = ?record_type, "creating dns record");
+        let mut cache = self.list_zone_cache.lock().await;
+        if let Some((time, zones)) = cache.as_ref() {
+            if Utc::now() - *time < CACHE_DURATION {
+                return Ok(zones.clone());
+            }
+        }
 
-    cloudflare_api_request::<DnsRecordInfo, _>(
-        &url,
-        Some(DnsRecordModification {
-            id,
+        let url = "https://api.cloudflare.com/client/v4/zones";
+        let zones = cloudflare_api_request::<Vec<AccountInfo>, ()>(url, None, Method::GET, &self.api_token).await?;
+        *cache = Some((Utc::now(), zones.clone()));
+
+        Ok(zones)
+    }
+
+    /// List DNS records in a cloudflare zone.
+    pub async fn list_dns_records(&self, zone_identifier: impl AsRef<str>) -> Result<Vec<DnsRecordInfo>> {
+        const CACHE_DURATION: Duration = Duration::minutes(1);
+
+        let zone_identifier = zone_identifier.as_ref();
+        let mut cache = self.list_dns_records_cache.lock().await;
+
+        if let Some((time, records)) = cache.get(zone_identifier) {
+            if Utc::now() - *time < CACHE_DURATION {
+                return Ok(records.clone());
+            }
+        }
+
+        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
+        let records = cloudflare_api_get_all::<DnsRecordInfo, ()>(&url, None, Method::GET, &self.api_token).await?;
+        cache.insert(zone_identifier.to_string(), (Utc::now(), records.clone()));
+
+        debug!(records = %records.len(), "listed dns records");
+
+        Ok(records)
+    }
+
+    /// Create a new cloudflare dns record
+    pub async fn create_dns_record(&self, args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
+        let CreateRecordArgs {
+            zone,
             name,
             record_type,
             content,
-            ttl,
-            proxied: None,
             comment,
-            tags: None,
-        }),
-        Method::POST,
-        api_token,
-    )
-    .await
-}
+            ttl,
+        } = args;
 
-/// Updates a cloudflare dns record... currently deletes and recreates... Will wait for the dns record to propagate,
-/// i.e. a dns lookup resolves to the correct ip.
-// TODO: we should use the proper patch api.
-pub async fn update_dns_record_and_wait(args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
-    let Some(zone_id) = args.zone.clone().lookup_id(&args.api_token).await? else {
-        bail!("zone not found");
-    };
-    let api_token = args.api_token.clone();
-    let domain = args.name.clone();
+        let zone_identifier = zone
+            .lookup_id(self)
+            .await?
+            .ok_or_else(|| eyre::eyre!("zone not found"))?;
+        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
+        let id = util::id();
 
-    let dns_records = list_dns_records(&zone_id, &api_token).await?;
-    if let Some(existing) = dns_records.into_iter().find(|record| record.name == domain) {
-        if existing.content == args.content {
-            info!("DNS record for {domain:?} already exists with {:?}", args.content);
+        info!(?id, ?name, r#type = ?record_type, "creating dns record");
+        let result = cloudflare_api_request::<DnsRecordInfo, _>(
+            &url,
+            Some(DnsRecordModification {
+                id,
+                name,
+                record_type,
+                content,
+                ttl,
+                proxied: None,
+                comment,
+                tags: None,
+            }),
+            Method::POST,
+            &self.api_token,
+        )
+        .await;
+
+        self.invalidate_dns_record_cache(zone_identifier).await;
+
+        result
+    }
+
+    /// Updates a cloudflare dns record... currently deletes and recreates... Will wait for the dns record to propagate,
+    /// i.e. a dns lookup resolves to the correct ip.
+    // TODO: we should use the proper patch api.
+    #[instrument(level = "debug", skip(self))]
+    pub async fn update_dns_record_and_wait(&self, args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
+        let Some(zone_id) = args.zone.clone().lookup_id(self).await? else {
+            bail!("zone not found");
+        };
+
+        debug!("updating dns record");
+
+        let domain = args.name.clone();
+        let dns_records = self.list_dns_records(&zone_id).await?;
+
+        let mut existing = None;
+        for record in dns_records.into_iter().filter(|record| record.name == domain) {
+            if record.content == args.content {
+                existing = Some(record);
+                info!("DNS record for {domain:?} already exists with {:?}", args.content);
+                continue;
+            }
+
+            warn!(
+                "Found existing DNS record for web domain {domain:?} with ip {:?}. Deleting.",
+                record.content
+            );
+            self.delete_dns_record(&zone_id, &record.id)
+                .await
+                .context("Failed to delete existing DNS record")?;
+        }
+
+        if let Some(existing) = existing {
             return Ok(existing);
         }
 
-        warn!(
-            "Found existing DNS record for web domain {domain:?} with ip {:?}. Deleting.",
-            existing.content
-        );
-        delete_dns_record(&zone_id, &existing.id, &api_token)
-            .await
-            .context("Failed to delete existing DNS record")?;
+        info!("Creating new DNS record for {domain:?} with {:?}", args.content);
+        let record = self.create_dns_record(args).await?;
+        debug!("Registered record for {domain:?} with {:?}", record.content);
+
+        self.invalidate_dns_record_cache(zone_id).await;
+
+        Ok(record)
     }
 
-    info!("Creating new DNS record for {domain:?} with {:?}", args.content);
+    /// Delete a DNS record by its (domain) name using the cloudflare API
+    #[allow(dead_code)]
+    pub async fn delete_dns_records_by_name(
+        &self,
+        name: impl AsRef<str>,
+        zone_identifier: impl AsRef<str>,
+    ) -> Result<(), eyre::Error> {
+        let name = name.as_ref();
+        let zone_identifier = zone_identifier.as_ref();
 
-    let record = create_dns_record(args).await?;
+        info!(?name, "deleting dns record by name");
+        let records = self
+            .list_dns_records(&zone_identifier)
+            .await?
+            .into_iter()
+            .filter(|it| it.name == name);
 
-    debug!("Registered record for {domain:?} with {:?}", record.content);
+        for record in records {
+            self.delete_dns_record(zone_identifier, record.id).await?;
+        }
 
-    Ok(record)
+        Ok(())
+    }
+
+    /// Delete a DNS record by its id using the cloudflare API.
+    pub async fn delete_dns_record(&self, zone_identifier: impl AsRef<str>, id: impl AsRef<str>) -> Result<()> {
+        let zone_identifier = zone_identifier.as_ref();
+        let id = id.as_ref();
+        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records/{id}");
+
+        cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, &self.api_token).await?;
+
+        self.invalidate_dns_record_cache(zone_identifier).await;
+
+        Ok(())
+    }
 }
 
-/// Delete a DNS record by its (domain) name using the cloudflare API
-#[allow(dead_code)]
-pub async fn delete_dns_record_by_name(
-    name: impl AsRef<str>,
-    zone_identifier: impl AsRef<str>,
+pub async fn cloudflare_api_get_all<T, B>(
+    url: &str,
+    body: Option<B>,
+    method: Method,
     api_token: impl AsRef<str>,
-) -> Result<(), eyre::Error> {
-    let name = name.as_ref();
-    let zone_identifier = zone_identifier.as_ref();
+) -> Result<Vec<T>>
+where
+    B: Serialize + Clone,
+    T: DeserializeOwned,
+{
+    let api_token = api_token.as_ref();
+    let mut results = Vec::new();
+    let mut current_page = 1usize;
 
-    info!(?name, "deleting dns record by name");
+    loop {
+        let query = format!("page={current_page}");
+        let url = if url.contains('?') {
+            format!("{url}&{query}")
+        } else {
+            format!("{url}?{query}")
+        };
 
-    let record = list_dns_records(&zone_identifier, api_token.as_ref())
-        .await?
-        .into_iter()
-        .find(|it| it.name == name);
+        let res = cloudflare_api_request_inner::<Vec<T>, _>(&url, body.clone(), method.clone(), api_token).await?;
 
-    let Some(record) = record else {
-        bail!("no record found with name: {name}");
-    };
+        results.extend(res.result);
 
-    delete_dns_record(zone_identifier, record.id, api_token).await?;
+        if let Some(info) = &res.result_info {
+            if current_page == info.total_pages {
+                break;
+            }
+        } else {
+            break;
+        }
 
-    Ok(())
-}
+        current_page += 1;
+    }
 
-/// Delete a DNS record by its id using the cloudflare API.
-pub async fn delete_dns_record(
-    zone_identifier: impl AsRef<str>,
-    id: impl AsRef<str>,
-    api_token: impl AsRef<str>,
-) -> Result<()> {
-    let zone_identifier = zone_identifier.as_ref();
-    let id = id.as_ref();
-    let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records/{id}");
-
-    cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, api_token).await?;
-
-    Ok(())
-}
-
-/// List DNS records in a cloudflare zone.
-pub async fn list_dns_records(
-    zone_identifier: impl AsRef<str>,
-    api_token: impl AsRef<str>,
-) -> Result<Vec<DnsRecordInfo>> {
-    let zone_identifier = zone_identifier.as_ref();
-    let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
-    cloudflare_api_request::<Vec<DnsRecordInfo>, ()>(&url, None, Method::GET, api_token).await
+    Ok(results)
 }
 
 pub async fn cloudflare_api_request<R, B>(
@@ -330,6 +446,22 @@ where
     B: Serialize,
     R: DeserializeOwned,
 {
+    let body = cloudflare_api_request_inner(url, body, method, api_token).await?;
+    Ok(body.result)
+}
+
+async fn cloudflare_api_request_inner<R, B>(
+    url: &str,
+    body: Option<B>,
+    method: Method,
+    api_token: impl AsRef<str>,
+) -> Result<ApiResult<R>>
+where
+    B: Serialize,
+    R: DeserializeOwned,
+{
+    debug!("[{method}] {url} cloudflare API request");
+
     let req = reqwest::Client::new()
         .request(method, url)
         .bearer_auth(api_token.as_ref())
@@ -348,7 +480,7 @@ where
     }
 
     #[cfg(debug_assertions)]
-    let body: ApiResult<_> = {
+    let body: ApiResult<R> = {
         let body: Value = res.json().await?;
         match serde_json::from_value(body.clone()) {
             Err(err) => bail!(
@@ -362,5 +494,5 @@ where
     #[cfg(not(debug_assertions))]
     let body: ApiResult<_> = res.json().await?;
 
-    Ok(body.result)
+    Ok(body)
 }

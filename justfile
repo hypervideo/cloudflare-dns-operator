@@ -30,6 +30,9 @@ release *args="":
     cargo readme > README.md
     cargo release {{ args }}
 
+cloudflare-api *args="":
+    cargo run --example cloudflare {{ args }}
+
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 example:
