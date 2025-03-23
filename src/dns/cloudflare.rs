@@ -403,6 +403,8 @@ where
     B: Serialize,
     R: DeserializeOwned,
 {
+    debug!("[{method}] {url} cloudflare API request");
+
     let req = reqwest::Client::new()
         .request(method, url)
         .bearer_auth(api_token.as_ref())

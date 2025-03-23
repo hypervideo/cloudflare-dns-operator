@@ -165,7 +165,7 @@ async fn reconcile(
             }
         }
 
-        Ok(Action::requeue(Duration::from_secs(60)))
+        Ok(Action::requeue(Duration::from_secs(5 * 60)))
     })
     .await
 }
