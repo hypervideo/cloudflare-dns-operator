@@ -163,7 +163,7 @@ pub async fn run(cmd: Command) -> Result<()> {
                 (None, Some(name)) => {
                     for name in name {
                         cloudflare_api
-                            .delete_dns_record_by_name(&name, &zone_identifier)
+                            .delete_dns_records_by_name(&name, &zone_identifier)
                             .await?;
                     }
                 }

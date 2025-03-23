@@ -354,7 +354,7 @@ impl CloudflareApi {
 
     /// Delete a DNS record by its (domain) name using the cloudflare API
     #[allow(dead_code)]
-    pub async fn delete_dns_record_by_name(
+    pub async fn delete_dns_records_by_name(
         &self,
         name: impl AsRef<str>,
         zone_identifier: impl AsRef<str>,
@@ -363,16 +363,15 @@ impl CloudflareApi {
         let zone_identifier = zone_identifier.as_ref();
 
         info!(?name, "deleting dns record by name");
-        let record = self
+        let records = self
             .list_dns_records(&zone_identifier)
             .await?
             .into_iter()
-            .find(|it| it.name == name);
-        let Some(record) = record else {
-            bail!("no record found with name: {name}");
-        };
+            .filter(|it| it.name == name);
 
-        self.delete_dns_record(zone_identifier, record.id).await?;
+        for record in records {
+            self.delete_dns_record(zone_identifier, record.id).await?;
+        }
 
         Ok(())
     }
