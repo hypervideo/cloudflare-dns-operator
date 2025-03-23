@@ -212,6 +212,13 @@ impl CloudflareApi {
         }
     }
 
+    async fn invalidate_dns_record_cache(&self, zone_identifier: impl AsRef<str>) {
+        self.list_dns_records_cache
+            .lock()
+            .await
+            .remove(zone_identifier.as_ref());
+    }
+
     /// List all cloudflare accounts which represent zones.
     pub async fn list_zones(&self) -> Result<Vec<AccountInfo>, eyre::Error> {
         const CACHE_DURATION: Duration = Duration::minutes(5);
@@ -270,7 +277,7 @@ impl CloudflareApi {
         let id = util::id();
 
         info!(?id, ?name, r#type = ?record_type, "creating dns record");
-        cloudflare_api_request::<DnsRecordInfo, _>(
+        let result = cloudflare_api_request::<DnsRecordInfo, _>(
             &url,
             Some(DnsRecordModification {
                 id,
@@ -285,7 +292,11 @@ impl CloudflareApi {
             Method::POST,
             &self.api_token,
         )
-        .await
+        .await;
+
+        self.invalidate_dns_record_cache(zone_identifier).await;
+
+        result
     }
 
     /// Updates a cloudflare dns record... currently deletes and recreates... Will wait for the dns record to propagate,
@@ -317,6 +328,8 @@ impl CloudflareApi {
         info!("Creating new DNS record for {domain:?} with {:?}", args.content);
         let record = self.create_dns_record(args).await?;
         debug!("Registered record for {domain:?} with {:?}", record.content);
+
+        self.invalidate_dns_record_cache(zone_id).await;
 
         Ok(record)
     }
@@ -353,6 +366,8 @@ impl CloudflareApi {
         let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records/{id}");
 
         cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, &self.api_token).await?;
+
+        self.invalidate_dns_record_cache(zone_identifier).await;
 
         Ok(())
     }
