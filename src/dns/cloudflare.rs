@@ -265,14 +265,10 @@ impl CloudflareApi {
         }
 
         let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
-        let records =
-            cloudflare_api_request::<Vec<DnsRecordInfo>, ()>(&url, None, Method::GET, &self.api_token).await?;
+        let records = cloudflare_api_get_all::<DnsRecordInfo, ()>(&url, None, Method::GET, &self.api_token).await?;
         cache.insert(zone_identifier.to_string(), (Utc::now(), records.clone()));
 
-        info!("Found the following records:");
-        for record in &records {
-            info!(%record);
-        }
+        debug!(records = %records.len(), "listed dns records");
 
         Ok(records)
     }
@@ -395,12 +391,66 @@ impl CloudflareApi {
     }
 }
 
+pub async fn cloudflare_api_get_all<T, B>(
+    url: &str,
+    body: Option<B>,
+    method: Method,
+    api_token: impl AsRef<str>,
+) -> Result<Vec<T>>
+where
+    B: Serialize + Clone,
+    T: DeserializeOwned,
+{
+    let api_token = api_token.as_ref();
+    let mut results = Vec::new();
+    let mut current_page = 1usize;
+
+    loop {
+        let query = format!("page={current_page}");
+        let url = if url.contains('?') {
+            format!("{url}&{query}")
+        } else {
+            format!("{url}?{query}")
+        };
+
+        let res = cloudflare_api_request_inner::<Vec<T>, _>(&url, body.clone(), method.clone(), api_token).await?;
+
+        results.extend(res.result);
+
+        if let Some(info) = &res.result_info {
+            if current_page == info.total_pages {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        current_page += 1;
+    }
+
+    Ok(results)
+}
+
 pub async fn cloudflare_api_request<R, B>(
     url: &str,
     body: Option<B>,
     method: Method,
     api_token: impl AsRef<str>,
 ) -> Result<R>
+where
+    B: Serialize,
+    R: DeserializeOwned,
+{
+    let body = cloudflare_api_request_inner(url, body, method, api_token).await?;
+    Ok(body.result)
+}
+
+async fn cloudflare_api_request_inner<R, B>(
+    url: &str,
+    body: Option<B>,
+    method: Method,
+    api_token: impl AsRef<str>,
+) -> Result<ApiResult<R>>
 where
     B: Serialize,
     R: DeserializeOwned,
@@ -425,7 +475,7 @@ where
     }
 
     #[cfg(debug_assertions)]
-    let body: ApiResult<_> = {
+    let body: ApiResult<R> = {
         let body: Value = res.json().await?;
         match serde_json::from_value(body.clone()) {
             Err(err) => bail!(
@@ -439,5 +489,5 @@ where
     #[cfg(not(debug_assertions))]
     let body: ApiResult<_> = res.json().await?;
 
-    Ok(body.result)
+    Ok(body)
 }
