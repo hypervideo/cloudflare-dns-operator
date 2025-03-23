@@ -165,7 +165,7 @@ async fn reconcile(
             }
         }
 
-        Ok(Action::requeue(Duration::from_secs(5 * 60)))
+        Ok(Action::requeue(Duration::from_secs(60)))
     })
     .await
 }
@@ -176,5 +176,14 @@ fn error_policy(
     _ctx: Arc<Context>,
 ) -> Action {
     error!("Error reconciling: {:?}", err);
-    Action::requeue(Duration::from_secs(15))
+
+    let is_rate_limit = match err {
+        finalizer::Error::CleanupFailed(ReconcileError::Other(report))
+        | finalizer::Error::ApplyFailed(ReconcileError::Other(report)) => {
+            report.to_string().contains("cloudflare api error") && report.to_string().contains("429")
+        }
+        _ => false,
+    };
+
+    Action::requeue(Duration::from_secs(if is_rate_limit { 5 * 60 } else { 60 }))
 }

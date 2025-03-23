@@ -327,6 +327,8 @@ impl CloudflareApi {
             bail!("zone not found");
         };
 
+        debug!("updating dns record");
+
         let domain = args.name.clone();
         let dns_records = self.list_dns_records(&zone_id).await?;
 
