@@ -84,11 +84,11 @@ pub struct DeleteRecordArgs {
     #[clap(env = "CLOUDFLARE_ZONE_ID")]
     pub zone_identifier: String,
 
-    #[clap(long = "id")]
-    pub record_identifier: Option<String>,
+    #[clap(long = "ids", value_delimiter = ',')]
+    pub record_identifiers: Option<Vec<String>>,
 
-    #[clap(long)]
-    pub name: Option<String>,
+    #[clap(long, value_delimiter = ',')]
+    pub names: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -147,21 +147,25 @@ pub async fn run(cmd: Command) -> Result<()> {
         Command::DeleteDnsRecord(DeleteRecordArgs {
             api_token,
             zone_identifier,
-            record_identifier,
-            name,
+            record_identifiers,
+            names,
         }) => {
             let cloudflare_api = CloudflareApi::new(api_token);
-            match (record_identifier, name) {
+            match (record_identifiers, names) {
                 (None, None) => bail!("must specify either record_identifier or name"),
                 (Some(record_identifier), _) => {
-                    cloudflare_api
-                        .delete_dns_record(zone_identifier, record_identifier)
-                        .await?;
+                    for record_identifier in record_identifier {
+                        cloudflare_api
+                            .delete_dns_record(zone_identifier.clone(), record_identifier)
+                            .await?;
+                    }
                 }
                 (None, Some(name)) => {
-                    cloudflare_api
-                        .delete_dns_record_by_name(&name, &zone_identifier)
-                        .await?;
+                    for name in name {
+                        cloudflare_api
+                            .delete_dns_record_by_name(&name, &zone_identifier)
+                            .await?;
+                    }
                 }
             };
         }
