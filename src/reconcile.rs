@@ -107,7 +107,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         return Ok(());
     };
 
-    let Some(zone) = zone.resolve(&ctx.cloudflare_api_token).await? else {
+    let Some(zone) = zone.resolve(&ctx.cloudflare_api).await? else {
         let msg = format!("unable to resolve zone for CloudflareDNSRecord {ns}/{name}");
         error!("{msg}");
         update_conditions(
@@ -124,16 +124,17 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
 
     debug!("updating dns record for CloudflareDNSRecord {ns}/{name}");
 
-    let record = cloudflare::update_dns_record_and_wait(cloudflare::CreateRecordArgs {
-        api_token: ctx.cloudflare_api_token.clone(),
-        zone,
-        name: domain_or_record_text.to_string(),
-        record_type: resource.spec.ty.unwrap_or_default(),
-        content,
-        comment: resource.spec.comment.clone(),
-        ttl: resource.spec.ttl,
-    })
-    .await?;
+    let record = ctx
+        .cloudflare_api
+        .update_dns_record_and_wait(cloudflare::CreateRecordArgs {
+            zone,
+            name: domain_or_record_text.to_string(),
+            record_type: resource.spec.ty.unwrap_or_default(),
+            content,
+            comment: resource.spec.comment.clone(),
+            ttl: resource.spec.ttl,
+        })
+        .await?;
 
     // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
@@ -210,7 +211,10 @@ pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> R
         return Ok(());
     };
 
-    if let Err(err) = cloudflare::delete_dns_record(&status.zone_id, &status.record_id, &ctx.cloudflare_api_token).await
+    if let Err(err) = ctx
+        .cloudflare_api
+        .delete_dns_record(&status.zone_id, &status.record_id)
+        .await
     {
         error!("Unable to delete dns record for cloudflare: {err}");
     }

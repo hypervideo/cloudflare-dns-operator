@@ -4,10 +4,10 @@
 }:
 
 rustPlatform.buildRustPackage {
-  version = "0.1.11";
+  version = "0.1.12";
   pname = name;
 
-  cargoHash = "sha256-fx4xGk+I+/qeDx8XMCkghw20BZMxNrqp039voykRYuk=";
+  cargoHash = "sha256-mOPbDJVDIMN7Sc+f0Kbq8001Evilt9QqgwbYtTJmYgE=";
   src = ../.;
 
   meta = with lib; {

@@ -3,10 +3,7 @@ use cloudflare_dns_operator::{
     dns::cloudflare::{
         self,
         cloudflare_api_request,
-        create_dns_record,
-        delete_dns_record,
-        delete_dns_record_by_name,
-        list_dns_records,
+        CloudflareApi,
         DnsRecordInfo,
     },
     resources::RecordType,
@@ -116,7 +113,8 @@ pub async fn run(cmd: Command) -> Result<()> {
             api_token,
             zone_identifier,
         }) => {
-            let records = list_dns_records(zone_identifier, api_token).await?;
+            let cloudflare_api = CloudflareApi::new(api_token);
+            let records = cloudflare_api.list_dns_records(zone_identifier).await?;
             for record in records {
                 let DnsRecordInfo {
                     id,
@@ -132,16 +130,17 @@ pub async fn run(cmd: Command) -> Result<()> {
         Command::UpdateDnsRecord(_) => todo!(),
 
         Command::CreateDnsRecord(args) => {
-            let result = create_dns_record(cloudflare::CreateRecordArgs {
-                api_token: args.api_token,
-                zone: cloudflare::Zone::Name(args.zone_name),
-                name: args.name,
-                record_type: args.record_type,
-                content: args.content,
-                comment: None,
-                ttl: args.ttl,
-            })
-            .await?;
+            let cloudflare_api = CloudflareApi::new(args.api_token);
+            let result = cloudflare_api
+                .create_dns_record(cloudflare::CreateRecordArgs {
+                    zone: cloudflare::Zone::Name(args.zone_name),
+                    name: args.name,
+                    record_type: args.record_type,
+                    content: args.content,
+                    comment: None,
+                    ttl: args.ttl,
+                })
+                .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
@@ -151,13 +150,18 @@ pub async fn run(cmd: Command) -> Result<()> {
             record_identifier,
             name,
         }) => {
+            let cloudflare_api = CloudflareApi::new(api_token);
             match (record_identifier, name) {
                 (None, None) => bail!("must specify either record_identifier or name"),
                 (Some(record_identifier), _) => {
-                    delete_dns_record(zone_identifier, record_identifier, api_token).await?;
+                    cloudflare_api
+                        .delete_dns_record(zone_identifier, record_identifier)
+                        .await?;
                 }
                 (None, Some(name)) => {
-                    delete_dns_record_by_name(&name, &zone_identifier, api_token).await?;
+                    cloudflare_api
+                        .delete_dns_record_by_name(&name, &zone_identifier)
+                        .await?;
                 }
             };
         }
