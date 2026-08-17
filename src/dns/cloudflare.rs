@@ -420,13 +420,10 @@ where
 
         let res = cloudflare_api_request_inner::<Vec<T>, _>(&url, body.clone(), method.clone(), api_token).await?;
 
+        let page_len = res.result.len();
         results.extend(res.result);
 
-        if let Some(info) = &res.result_info {
-            if current_page == info.total_pages {
-                break;
-            }
-        } else {
+        if !has_more_pages(res.result_info.as_ref(), page_len, current_page) {
             break;
         }
 
@@ -434,6 +431,54 @@ where
     }
 
     Ok(results)
+}
+
+/// Whether to fetch the page after `current_page`. Records can be deleted
+/// while we paginate, shrinking `total_pages` below `current_page`; cloudflare
+/// answers out-of-range pages with an empty success, so a `==` comparison
+/// against `total_pages` never terminates. Only continue while the current
+/// page was non-empty and more pages are reported ahead.
+fn has_more_pages(info: Option<&ApiResultInfo>, page_len: usize, current_page: usize) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    page_len > 0 && current_page < info.total_pages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(total_pages: usize) -> ApiResultInfo {
+        ApiResultInfo {
+            count: 0,
+            page: 0,
+            per_page: 100,
+            total_count: 0,
+            total_pages,
+        }
+    }
+
+    #[test]
+    fn pagination_stops_on_last_page() {
+        assert!(has_more_pages(Some(&info(2)), 100, 1));
+        assert!(!has_more_pages(Some(&info(2)), 88, 2));
+        assert!(!has_more_pages(Some(&info(1)), 100, 1));
+    }
+
+    #[test]
+    fn pagination_stops_when_total_pages_shrinks_below_current_page() {
+        // regression: records deleted mid-listing shrank total_pages below
+        // current_page and the operator paginated forever (2026-08-14)
+        assert!(!has_more_pages(Some(&info(1)), 0, 3));
+        assert!(!has_more_pages(Some(&info(1)), 0, 213_898));
+    }
+
+    #[test]
+    fn pagination_stops_without_result_info_or_results() {
+        assert!(!has_more_pages(None, 100, 1));
+        assert!(!has_more_pages(Some(&info(5)), 0, 2));
+    }
 }
 
 pub async fn cloudflare_api_request<R, B>(
