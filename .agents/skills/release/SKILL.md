@@ -1,6 +1,6 @@
 ---
 name: release
-description: Prepare and publish a cloudflare-dns-operator release. Use when asked to release the project, bump its version, create a release commit and Git tag, or build and push its versioned and latest Docker images.
+description: Prepare, publish, and deploy a cloudflare-dns-operator release. Use when asked to release the project, bump its version, create a release commit and Git tag, push its Docker images, or update its version in the infra repository.
 ---
 
 # Release
@@ -46,4 +46,20 @@ Run project commands from the repository root through the default Nix developmen
 2. Require both `robertkrahn/cloudflare-dns-operator:X.Y.Z` and `robertkrahn/cloudflare-dns-operator:latest` to push successfully.
 3. Report the commit, Git tag, Docker tags, and verification results.
 
-Do not push the Git branch or tag unless the user asks. Do not amend commits, force-push, delete tags, or discard changes. If Docker publishing fails after the commit and tag exist, preserve them and report the failed command and error.
+## Offer the infra update
+
+After the Docker push succeeds:
+
+1. Check these files in order and select the first readable regular file:
+   - `~/projects/shuttle/infra/k8s/infrastructure/controllers/cloudflare-dns-operator/cloudflare-dns-operator/kustomization.yaml`
+   - `~/projects/hyper/infra/k8s/infrastructure/controllers/cloudflare-dns-operator/cloudflare-dns-operator/kustomization.yaml`
+2. Skip this section without error if neither file is available.
+3. Confirm that the selected file contains the image `robertkrahn/cloudflare-dns-operator` and read its current `newTag` value.
+4. Offer to change `newTag` to `X.Y.Z`. Name the selected file and show both the current and proposed tags. Do not modify the file until the user agrees.
+5. After the user agrees, read the infra repository instructions and inspect its Git status. Preserve unrelated changes.
+6. Change only the `newTag` for the selected image. Run the relevant checks defined by the infra repository, then run `git diff --check`.
+7. Show the exact diff and offer to commit and push it to the infra repository. Name the current branch and remote. Do not commit or push until the user agrees.
+8. After the user agrees, stage only the selected file, create the commit with `git commit -m "use cloudflare-dns-operator:X.Y.Z"`, and push the current branch to its upstream remote.
+9. Report the infra commit and push result.
+
+Do not push the cloudflare-dns-operator Git branch or tag unless the user asks. Do not amend commits, force-push, delete tags, or discard changes. If Docker publishing fails after the commit and tag exist, preserve them and report the failed command and error.

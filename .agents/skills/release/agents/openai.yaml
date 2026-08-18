@@ -1,4 +1,4 @@
 interface:
   display_name: "Release"
-  short_description: "Prepare, tag, and publish a release"
+  short_description: "Prepare, publish, and deploy a release"
   default_prompt: "Use $release to publish the next project release."
