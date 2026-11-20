@@ -93,7 +93,7 @@ impl CloudflareDNSRecordSpec {
         match &self.content {
             StringOrService::Value(value) => Ok(Some(value.clone())),
             StringOrService::Service(selector) => {
-                let ns = selector.namespace.as_deref().unwrap_or(ns);
+                let ns = selector.namespace_or(ns);
                 let name = selector.name.as_str();
                 let record_type = self.ty;
                 let Some(ip) = crate::services::public_ip_from_service(client, name, ns, record_type).await? else {
@@ -143,6 +143,14 @@ pub struct ServiceSelector {
     pub name: String,
     /// Namespace, default is the same namespace as the referent.
     pub namespace: Option<String>,
+}
+
+impl ServiceSelector {
+    /// The namespace of the selected service. A selector without a namespace selects a service in `record_ns`, the
+    /// namespace of the record that holds the selector.
+    pub fn namespace_or<'a>(&'a self, record_ns: &'a str) -> &'a str {
+        self.namespace.as_deref().unwrap_or(record_ns)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

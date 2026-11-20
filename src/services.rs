@@ -17,13 +17,16 @@ pub fn records_using_service(
     svc: &Service,
     records: &[Arc<CloudflareDNSRecord>],
 ) -> Vec<ObjectRef<CloudflareDNSRecord>> {
+    let (Some(name), Some(ns)) = (svc.metadata.name.as_deref(), svc.metadata.namespace.as_deref()) else {
+        return Vec::new();
+    };
     records
         .iter()
         .filter(|record| match &record.spec.content {
             StringOrService::Service(selector) => {
-                // A selector without a namespace selects a service in the namespace of the record.
-                let ns = selector.namespace.as_ref().or(record.metadata.namespace.as_ref());
-                Some(&selector.name) == svc.metadata.name.as_ref() && ns == svc.metadata.namespace.as_ref()
+                // the same namespace that reconcile::apply passes to lookup_content
+                let record_ns = record.metadata.namespace.as_deref().unwrap_or("default");
+                selector.name == name && selector.namespace_or(record_ns) == ns
             }
             StringOrService::Value(_) => false,
         })
