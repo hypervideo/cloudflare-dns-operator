@@ -29,7 +29,6 @@ use kube::{
     CustomResourceExt as _,
     Resource as _,
 };
-use services::is_suitable_service;
 use std::{
     net::SocketAddr,
     sync::Arc,
@@ -117,13 +116,14 @@ async fn run_controller(
 
     info!("Starting controller");
 
-    Controller::new(dns_resources, Default::default())
-        // watch load balancers / external ip services to adjust dns <-> public ip
-        .watches(
-            Api::<Service>::all(client),
-            watcher::Config::default(),
-            is_suitable_service,
-        )
+    let controller = Controller::new(dns_resources, Default::default());
+    let records = controller.store();
+
+    controller
+        // when a service changes, e.g. gets a new public ip, reconcile the records whose content comes from it
+        .watches(Api::<Service>::all(client), watcher::Config::default(), move |svc| {
+            services::records_using_service(&svc, &records.state())
+        })
         .reconcile_on(dns_change)
         .shutdown_on_signal()
         .run(reconcile, error_policy, context)
