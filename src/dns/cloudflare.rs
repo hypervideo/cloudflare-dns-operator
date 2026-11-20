@@ -25,6 +25,10 @@ use tokio::sync::Mutex;
 // curl 'https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project_name}/deployments' --header 'Authorization: Bearer <API_TOKEN>'
 // c8bba8ee5e5c7b5f8b20bc4d5ca0de58
 
+/// How long one cloudflare request may take, from connecting until the response body is read. The caches in
+/// [`CloudflareApi`] stay locked during their request, so a request that never finishes would block every reconcile.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Wraps the cloudflare api response.
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiResult<T> {
@@ -256,6 +260,8 @@ impl CloudflareApi {
         const CACHE_DURATION: Duration = Duration::minutes(1);
 
         let zone_identifier = zone_identifier.as_ref();
+        // Keep the cache locked during the request. Concurrent reconciles then wait for this listing and read it from
+        // the cache instead of each listing the zone, which would exceed cloudflare's rate limit.
         let mut cache = self.list_dns_records_cache.lock().await;
 
         if let Some((time, records)) = cache.get(zone_identifier) {
@@ -479,6 +485,23 @@ mod tests {
         assert!(!has_more_pages(None, 100, 1));
         assert!(!has_more_pages(Some(&info(5)), 0, 2));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_to_unresponsive_server_times_out() {
+        // regression: a request that never got an answer held the dns record
+        // cache lock forever and stopped all reconciles (2026-11-20)
+        // The kernel accepts the connection, but nobody ever answers.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.local_addr().unwrap());
+
+        let request = cloudflare_api_request::<Value, ()>(&url, None, Method::GET, "token");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(600), request)
+            .await
+            .expect("the request never gave up");
+
+        let err = result.unwrap_err();
+        assert!(err.downcast_ref::<reqwest::Error>().unwrap().is_timeout(), "{err:?}");
+    }
 }
 
 pub async fn cloudflare_api_request<R, B>(
@@ -507,7 +530,9 @@ where
 {
     debug!("[{method}] {url} cloudflare API request");
 
-    let req = reqwest::Client::new()
+    let req = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?
         .request(method, url)
         .bearer_auth(api_token.as_ref())
         .header("Content-Type", "application/json");
