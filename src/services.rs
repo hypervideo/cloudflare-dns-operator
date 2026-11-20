@@ -143,6 +143,12 @@ mod tests {
             record("traefik", "dashboard", json!({ "service": { "name": "traefik" } })),
             // named like the service, but uses the service app/traefik
             record("app", "traefik", json!({ "service": { "name": "traefik" } })),
+            // in the namespace of the service, but uses the service app/traefik
+            record(
+                "traefik",
+                "elsewhere",
+                json!({ "service": { "name": "traefik", "namespace": "app" } }),
+            ),
             record("traefik", "api", json!({ "service": { "name": "api" } })),
             record("traefik", "static", json!({ "value": "1.2.3.4" })),
         ];
