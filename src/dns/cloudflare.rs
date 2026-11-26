@@ -1,5 +1,8 @@
 use super::util;
-use crate::resources::RecordType;
+use crate::resources::{
+    normalize_dns_name,
+    RecordType,
+};
 use chrono::{
     prelude::*,
     Duration,
@@ -228,6 +231,14 @@ impl Zone {
     }
 }
 
+/// Result of [`CloudflareApi::update_dns_record_and_wait`].
+#[derive(Debug, Clone)]
+pub struct UpdatedDnsRecord {
+    pub record: DnsRecordInfo,
+    /// Cloudflare record IDs that were deleted while replacing mismatched records of the same name and type.
+    pub deleted_ids: Vec<String>,
+}
+
 /// Arguments for [`create_dns_record`].
 #[derive(Debug)]
 pub struct CreateRecordArgs {
@@ -362,44 +373,58 @@ impl CloudflareApi {
     /// i.e. a dns lookup resolves to the correct ip.
     // TODO: we should use the proper patch api.
     #[instrument(level = "debug", skip(self))]
-    pub async fn update_dns_record_and_wait(&self, args: CreateRecordArgs) -> Result<DnsRecordInfo, eyre::Error> {
+    pub async fn update_dns_record_and_wait(&self, args: CreateRecordArgs) -> Result<UpdatedDnsRecord, eyre::Error> {
         let Some(zone_id) = args.zone.clone().lookup_id(self).await? else {
             bail!("zone not found");
         };
 
         debug!("updating dns record");
 
-        let domain = args.name.clone();
+        let domain = normalize_dns_name(&args.name);
+        let record_type = args.record_type;
         let dns_records = self.list_dns_records(&zone_id).await?;
 
         let mut existing = None;
-        for record in dns_records.into_iter().filter(|record| record.name == domain) {
+        let mut deleted_ids = Vec::new();
+        for record in dns_records.into_iter().filter(|record| {
+            normalize_dns_name(&record.name) == domain && record.record_type.eq_ignore_ascii_case(record_type.as_str())
+        }) {
             if record.content == args.content {
                 existing = Some(record);
-                info!("DNS record for {domain:?} already exists with {:?}", args.content);
+                info!(
+                    "DNS record for {domain:?} ({record_type:?}) already exists with {:?}",
+                    args.content
+                );
                 continue;
             }
 
             warn!(
-                "Found existing DNS record for web domain {domain:?} with ip {:?}. Deleting.",
+                "Found existing DNS record for web domain {domain:?} ({record_type:?}) with ip {:?}. Deleting.",
                 record.content
             );
             self.delete_dns_record(&zone_id, &record.id)
                 .await
                 .context("Failed to delete existing DNS record")?;
+            deleted_ids.push(record.id);
         }
 
         if let Some(existing) = existing {
-            return Ok(existing);
+            return Ok(UpdatedDnsRecord {
+                record: existing,
+                deleted_ids,
+            });
         }
 
-        info!("Creating new DNS record for {domain:?} with {:?}", args.content);
+        info!(
+            "Creating new DNS record for {domain:?} ({record_type:?}) with {:?}",
+            args.content
+        );
         let record = self.create_dns_record(args).await?;
         debug!("Registered record for {domain:?} with {:?}", record.content);
 
         self.invalidate_dns_record_cache(zone_id).await;
 
-        Ok(record)
+        Ok(UpdatedDnsRecord { record, deleted_ids })
     }
 
     /// Delete a DNS record by its (domain) name using the cloudflare API
@@ -409,7 +434,7 @@ impl CloudflareApi {
         name: impl AsRef<str>,
         zone_identifier: impl AsRef<str>,
     ) -> Result<(), eyre::Error> {
-        let name = name.as_ref();
+        let name = normalize_dns_name(name.as_ref());
         let zone_identifier = zone_identifier.as_ref();
 
         info!(?name, "deleting dns record by name");
@@ -417,7 +442,7 @@ impl CloudflareApi {
             .list_dns_records(&zone_identifier)
             .await?
             .into_iter()
-            .filter(|it| it.name == name);
+            .filter(|it| normalize_dns_name(&it.name) == name);
 
         for record in records {
             self.delete_dns_record(zone_identifier, record.id).await?;
@@ -549,6 +574,152 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(err.downcast_ref::<reqwest::Error>().unwrap().is_timeout(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn update_dns_record_matches_record_type_and_normalized_name() {
+        // regression: update_dns_record_and_wait filtered only by exact `record.name == domain`, so reconciling an A
+        // record deleted TXT/AAAA records with the same name and missed uppercase or trailing-dot names
+        use std::{
+            io::{
+                Read as _,
+                Write as _,
+            },
+            sync::{
+                atomic::{
+                    AtomicBool,
+                    Ordering,
+                },
+                Mutex as StdMutex,
+            },
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reqs = requests.clone();
+        let stop_flag = stop.clone();
+
+        let list_body = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [
+                {
+                    "id": "rec-txt",
+                    "name": "example.com",
+                    "type": "TXT",
+                    "content": "v=spf1 -all",
+                    "ttl": 300,
+                    "proxiable": false,
+                    "proxied": false,
+                    "created_on": "2026-01-01T00:00:00Z",
+                    "modified_on": "2026-01-01T00:00:00Z",
+                    "meta": {},
+                    "tags": []
+                },
+                {
+                    "id": "rec-a",
+                    "name": "EXAMPLE.COM",
+                    "type": "A",
+                    "content": "1.2.3.4",
+                    "ttl": 300,
+                    "proxiable": true,
+                    "proxied": false,
+                    "created_on": "2026-01-01T00:00:00Z",
+                    "modified_on": "2026-01-01T00:00:00Z",
+                    "meta": {},
+                    "tags": []
+                }
+            ]
+        })
+        .to_string();
+
+        let created_body = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": {
+                "id": "rec-new",
+                "name": "example.com",
+                "type": "A",
+                "content": "1.2.3.4",
+                "ttl": 300,
+                "proxiable": true,
+                "proxied": false,
+                "created_on": "2026-01-01T00:00:00Z",
+                "modified_on": "2026-01-01T00:00:00Z",
+                "meta": {},
+                "tags": []
+            }
+        })
+        .to_string();
+
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req_text = String::from_utf8_lossy(&buf[..n]);
+                        let first_line = req_text.lines().next().unwrap_or("");
+                        let mut parts = first_line.split_whitespace();
+                        let method = parts.next().unwrap_or("");
+                        let path = parts.next().unwrap_or("");
+                        reqs.lock().unwrap().push(format!("{method} {path}"));
+                        let body = match method {
+                            "GET" => list_body.as_str(),
+                            "POST" => created_body.as_str(),
+                            _ => r#"{"success":true,"errors":[],"messages":[],"result":{"id":"deleted"}}"#,
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let api = CloudflareApi::with_base_url("token".to_string(), base_url);
+        let result = api
+            .update_dns_record_and_wait(CreateRecordArgs {
+                zone: Zone::id("zone-1"),
+                name: "example.com.".to_string(),
+                record_type: RecordType::A,
+                content: "1.2.3.4".to_string(),
+                comment: None,
+                ttl: None,
+            })
+            .await;
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let seen = requests.lock().unwrap().clone();
+        let updated = result.expect("update_dns_record_and_wait failed");
+        assert_eq!(
+            updated.record.id, "rec-a",
+            "should reuse existing A record; requests: {seen:?}"
+        );
+        assert!(updated.deleted_ids.is_empty());
+        assert!(
+            !seen.iter().any(|r| r.starts_with("DELETE ")),
+            "must not delete TXT record when reconciling A record: {seen:?}"
+        );
     }
 }
 

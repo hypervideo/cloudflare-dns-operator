@@ -16,7 +16,7 @@ use serde::{
 ///
 /// See https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/#dns-record-types
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize, Clone, Copy, JsonSchema)]
+#[derive(Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy, JsonSchema)]
 pub enum RecordType {
     #[default]
     #[serde(rename = "A")]
@@ -37,6 +37,27 @@ pub enum RecordType {
     SPF,
     #[serde(rename = "NS")]
     NS,
+}
+
+impl RecordType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecordType::A => "A",
+            RecordType::AAAA => "AAAA",
+            RecordType::CNAME => "CNAME",
+            RecordType::MX => "MX",
+            RecordType::TXT => "TXT",
+            RecordType::SRV => "SRV",
+            RecordType::LOC => "LOC",
+            RecordType::SPF => "SPF",
+            RecordType::NS => "NS",
+        }
+    }
+}
+
+/// Normalizes a DNS name for case-insensitive comparison without trailing dots.
+pub fn normalize_dns_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl std::str::FromStr for RecordType {
