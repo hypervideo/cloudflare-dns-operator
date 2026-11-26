@@ -29,6 +29,32 @@ use tokio::sync::Mutex;
 /// [`CloudflareApi`] stay locked during their request, so a request that never finishes would block every reconcile.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+const DEFAULT_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
+
+/// Non-success HTTP response returned by the Cloudflare API.
+#[derive(thiserror::Error, Debug)]
+#[error("cloudflare api error: status={status:?}, body={body:?}")]
+pub struct CloudflareApiError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+pub fn is_cloudflare_rate_limit(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<CloudflareApiError>()
+            .is_some_and(|api_err| api_err.status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+    })
+}
+
+fn is_cloudflare_not_found(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<CloudflareApiError>()
+            .is_some_and(|api_err| api_err.status == reqwest::StatusCode::NOT_FOUND)
+    })
+}
+
 /// Wraps the cloudflare api response.
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiResult<T> {
@@ -217,6 +243,7 @@ pub struct CreateRecordArgs {
 #[derive(Clone, Debug)]
 pub struct CloudflareApi {
     api_token: String,
+    base_url: String,
     list_zone_cache: Arc<Mutex<Option<(DateTime<Utc>, Vec<AccountInfo>)>>>,
     list_dns_records_cache: Arc<Mutex<HashMap<String, (DateTime<Utc>, Vec<DnsRecordInfo>)>>>,
 }
@@ -225,6 +252,17 @@ impl CloudflareApi {
     pub fn new(api_token: String) -> Self {
         Self {
             api_token,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            list_zone_cache: Default::default(),
+            list_dns_records_cache: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base_url(api_token: String, base_url: impl Into<String>) -> Self {
+        Self {
+            api_token,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             list_zone_cache: Default::default(),
             list_dns_records_cache: Default::default(),
         }
@@ -248,8 +286,8 @@ impl CloudflareApi {
             }
         }
 
-        let url = "https://api.cloudflare.com/client/v4/zones";
-        let zones = cloudflare_api_request::<Vec<AccountInfo>, ()>(url, None, Method::GET, &self.api_token).await?;
+        let url = format!("{}/zones", self.base_url);
+        let zones = cloudflare_api_request::<Vec<AccountInfo>, ()>(&url, None, Method::GET, &self.api_token).await?;
         *cache = Some((Utc::now(), zones.clone()));
 
         Ok(zones)
@@ -270,7 +308,7 @@ impl CloudflareApi {
             }
         }
 
-        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
+        let url = format!("{}/zones/{zone_identifier}/dns_records", self.base_url);
         let records = cloudflare_api_get_all::<DnsRecordInfo, ()>(&url, None, Method::GET, &self.api_token).await?;
         cache.insert(zone_identifier.to_string(), (Utc::now(), records.clone()));
 
@@ -294,7 +332,7 @@ impl CloudflareApi {
             .lookup_id(self)
             .await?
             .ok_or_else(|| eyre::eyre!("zone not found"))?;
-        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records");
+        let url = format!("{}/zones/{zone_identifier}/dns_records", self.base_url);
         let id = util::id();
 
         info!(?id, ?name, r#type = ?record_type, "creating dns record");
@@ -389,12 +427,22 @@ impl CloudflareApi {
     }
 
     /// Delete a DNS record by its id using the cloudflare API.
+    /// Treats 404 Not Found as already deleted so retries are idempotent.
     pub async fn delete_dns_record(&self, zone_identifier: impl AsRef<str>, id: impl AsRef<str>) -> Result<()> {
         let zone_identifier = zone_identifier.as_ref();
         let id = id.as_ref();
-        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_identifier}/dns_records/{id}");
+        let url = format!("{}/zones/{zone_identifier}/dns_records/{id}", self.base_url);
 
-        cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, &self.api_token).await?;
+        match cloudflare_api_request::<Value, ()>(&url, None, Method::DELETE, &self.api_token).await {
+            Ok(_) => {}
+            Err(err) if is_cloudflare_not_found(&err) => {
+                warn!(
+                    zone_identifier,
+                    id, "Cloudflare DNS record already gone (404), treating delete as done"
+                );
+            }
+            Err(err) => return Err(err),
+        }
 
         self.invalidate_dns_record_cache(zone_identifier).await;
 
@@ -542,11 +590,12 @@ where
     let res = req.send().await?;
 
     if !res.status().is_success() {
-        bail!(
-            "cloudflare api error: status={:?}, body={:?}",
-            res.status(),
-            res.text().await?
-        );
+        let status = res.status();
+        let body = res
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+        return Err(CloudflareApiError { status, body }.into());
     }
 
     #[cfg(debug_assertions)]
@@ -563,6 +612,10 @@ where
 
     #[cfg(not(debug_assertions))]
     let body: ApiResult<_> = res.json().await?;
+
+    if !body.success {
+        bail!("cloudflare api error: success=false, errors={}", body.errors);
+    }
 
     Ok(body)
 }

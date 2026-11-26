@@ -4,7 +4,10 @@ extern crate tracing;
 use clap::Parser;
 use cloudflare_dns_operator::{
     context,
-    dns::cloudflare::CloudflareApi,
+    dns::cloudflare::{
+        is_cloudflare_rate_limit,
+        CloudflareApi,
+    },
     dns_check,
     reconcile::{
         self,
@@ -143,22 +146,25 @@ async fn reconcile(
     let api: Api<resources::CloudflareDNSRecord> = Api::namespaced(ctx.client.clone(), ns);
 
     finalizer(&api, "dns.cloudflare.com/delete-dns-record", resource, |event| async {
-        let result = match event {
-            Event::Apply(server) => reconcile::apply(server, ctx.clone()).await,
-            Event::Cleanup(server) => reconcile::cleanup(server, ctx.clone()).await,
-        };
-
-        if let Err(err) = result {
-            match err {
-                reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 409 => {
-                    warn!("Conflict when reconciling object: {err}");
+        match event {
+            Event::Apply(server) => {
+                if let Err(err) = reconcile::apply(server, ctx.clone()).await {
+                    match err {
+                        reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 409 => {
+                            warn!("Conflict when reconciling object: {err}");
+                        }
+                        reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 404 => {
+                            warn!("Object not found when reconciling object: {err}");
+                        }
+                        err => {
+                            return Err(err);
+                        }
+                    }
                 }
-                reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 404 => {
-                    warn!("Object not found when reconciling object: {err}");
-                }
-                err => {
-                    return Err(err);
-                }
+            }
+            Event::Cleanup(server) => {
+                // Never swallow errors during cleanup: returning Ok drops the finalizer.
+                reconcile::cleanup(server, ctx.clone()).await?;
             }
         }
 
@@ -176,9 +182,7 @@ fn error_policy(
 
     let is_rate_limit = match err {
         finalizer::Error::CleanupFailed(ReconcileError::Other(report))
-        | finalizer::Error::ApplyFailed(ReconcileError::Other(report)) => {
-            report.to_string().contains("cloudflare api error") && report.to_string().contains("429")
-        }
+        | finalizer::Error::ApplyFailed(ReconcileError::Other(report)) => is_cloudflare_rate_limit(report),
         _ => false,
     };
 
