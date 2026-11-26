@@ -270,7 +270,8 @@ mod tests {
         record.metadata.namespace = Some("app".to_string());
 
         let deleted_record = async {
-            let (request, respond) = api_server.next_request().await.expect("a request");
+            let next_request = tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request());
+            let (request, respond) = next_request.await.expect("a request in time").expect("a request");
             assert_eq!(request.method(), Method::PATCH);
             assert_eq!(
                 request.uri().path(),
