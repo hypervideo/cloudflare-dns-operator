@@ -163,7 +163,8 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
     write_status(&resource, &ctx, status).await
 }
 
-/// This functions runs before the resource is deleted. It'll try to delete the DNS record from Cloudflare.
+/// Runs before the resource is deleted. Deletes the DNS record from Cloudflare, or returns an error so
+/// `kube::runtime::finalizer` keeps the finalizer and retries.
 #[instrument(level = "debug", skip_all)]
 pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<(), ReconcileError> {
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
@@ -171,18 +172,38 @@ pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> R
 
     info!("delete request: CloudflareDNSRecord {ns}/{name}");
 
-    let Some(status) = resource.status.as_ref() else {
-        error!("missing status for CloudflareDNSRecord {ns}/{name}");
+    // Read the live object from the API server so we do not miss status written by apply before the cache updated.
+    let api = Api::<CloudflareDNSRecord>::namespaced(ctx.client.clone(), ns);
+    let Some(live) = api.get_opt(name).await? else {
+        warn!("CloudflareDNSRecord {ns}/{name} already deleted, skipping cleanup");
         return Ok(());
     };
 
-    if let Err(err) = ctx
-        .cloudflare_api
-        .delete_dns_record(&status.zone_id, &status.record_id)
-        .await
-    {
-        error!("Unable to delete dns record for cloudflare: {err}");
+    // If the record was deleted and recreated with the same name while this cleanup was queued, do not touch the
+    // replacement's Cloudflare record or let the finalizer helper strip the replacement's finalizer.
+    let uid_mismatch = resource.metadata.uid.is_some() && live.metadata.uid != resource.metadata.uid;
+    let deletion_cleared = resource.metadata.deletion_timestamp.is_some() && live.metadata.deletion_timestamp.is_none();
+    if uid_mismatch || deletion_cleared {
+        return Err(eyre::eyre!(
+            "CloudflareDNSRecord {ns}/{name} was replaced before cleanup (uid {:?} != {:?})",
+            resource.metadata.uid,
+            live.metadata.uid
+        )
+        .into());
     }
+
+    let Some(status) = live
+        .status
+        .as_ref()
+        .filter(|status| !status.zone_id.is_empty() && !status.record_id.is_empty())
+    else {
+        warn!("no Cloudflare record ID in live status for CloudflareDNSRecord {ns}/{name}, skipping Cloudflare delete");
+        return Ok(());
+    };
+
+    ctx.cloudflare_api
+        .delete_dns_record(&status.zone_id, &status.record_id)
+        .await?;
 
     Ok(())
 }
@@ -379,5 +400,394 @@ mod tests {
         assert!(!saw_delete, "apply must not delete the record it reconciles");
         assert!(saw_status_patch, "apply should write status instead of deleting");
         assert!(result.is_ok(), "apply returned error: {result:?}");
+    }
+
+    struct MockCloudflare {
+        base_url: String,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockCloudflare {
+        fn start(status: u16, body: &'static str) -> Self {
+            use std::{
+                io::{
+                    Read as _,
+                    Write as _,
+                },
+                sync::atomic::Ordering,
+                time::Duration,
+            };
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reqs = requests.clone();
+            let stop_flag = stop.clone();
+
+            let handle = std::thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            let mut buf = [0u8; 4096];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            let req_text = String::from_utf8_lossy(&buf[..n]);
+                            if let Some(line) = req_text.lines().next() {
+                                let mut parts = line.split_whitespace();
+                                if let (Some(method), Some(path)) = (parts.next(), parts.next()) {
+                                    reqs.lock().unwrap().push(format!("{method} {path}"));
+                                }
+                            }
+                            let resp = format!(
+                                "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                base_url,
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MockCloudflare {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn sample_record(status: Option<CloudflareDNSRecordStatus>) -> CloudflareDNSRecord {
+        let spec = json!({
+            "name": "app.example.com",
+            "content": { "value": "1.2.3.4" },
+            "zone": { "id": { "value": "zone-1" } }
+        });
+        let mut record = CloudflareDNSRecord::new("web", serde_json::from_value(spec).unwrap());
+        record.metadata.namespace = Some("app".to_string());
+        record.metadata.uid = Some("uid-1".to_string());
+        record.status = status;
+        record
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_cloudflare_record_using_live_status_when_cache_lacks_it() {
+        // regression: cleanup read status from the controller cache, so a deletion right after apply
+        // could see status=None and drop the finalizer without deleting the Cloudflare record
+        let cf = MockCloudflare::start(
+            200,
+            r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-1"}}"#,
+        );
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        let cached = sample_record(None);
+        let live = sample_record(Some(CloudflareDNSRecordStatus {
+            record_id: "rec-1".to_string(),
+            zone_id: "zone-1".to_string(),
+            pending: false,
+            conditions: None,
+        }));
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                assert_eq!(request.method(), Method::GET);
+                assert_eq!(
+                    request.uri().path(),
+                    "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web"
+                );
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(cached), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert!(result.is_ok(), "cleanup failed: {result:?}");
+        assert_eq!(cf_requests, vec!["DELETE /zones/zone-1/dns_records/rec-1"]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_finalizer_by_returning_error_on_cloudflare_delete_failure() {
+        // regression: cleanup logged and ignored Cloudflare delete errors and returned Ok,
+        // causing kube::runtime::finalizer to drop the finalizer while the Cloudflare record stayed behind
+        let cf = MockCloudflare::start(
+            500,
+            r#"{"success":false,"errors":[{"code":1000,"message":"internal error"}],"messages":[],"result":null}"#,
+        );
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        let live = sample_record(Some(CloudflareDNSRecordStatus {
+            record_id: "rec-1".to_string(),
+            zone_id: "zone-1".to_string(),
+            pending: false,
+            conditions: None,
+        }));
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                assert_eq!(request.method(), Method::GET);
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(live), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert_eq!(cf_requests, vec!["DELETE /zones/zone-1/dns_records/rec-1"]);
+        assert!(
+            matches!(result, Err(ReconcileError::Other(_))),
+            "expected cleanup to return Err so finalizer stays, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_succeeds_when_cloudflare_record_is_already_gone() {
+        let cf = MockCloudflare::start(
+            404,
+            r#"{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}],"messages":[],"result":null}"#,
+        );
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        let live = sample_record(Some(CloudflareDNSRecordStatus {
+            record_id: "rec-1".to_string(),
+            zone_id: "zone-1".to_string(),
+            pending: false,
+            conditions: None,
+        }));
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((_request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(live), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert_eq!(cf_requests, vec!["DELETE /zones/zone-1/dns_records/rec-1"]);
+        assert!(result.is_ok(), "404 should let finalizer be removed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_cloudflare_delete_when_live_status_has_no_record_id() {
+        let cf = MockCloudflare::start(500, r#"{"success":false,"errors":[],"messages":[],"result":null}"#);
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        // Mirrors what update_conditions writes when apply fails before creating a Cloudflare record.
+        let live = sample_record(Some(CloudflareDNSRecordStatus::default()));
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((_request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(live), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert!(cf_requests.is_empty(), "should not call Cloudflare: {cf_requests:?}");
+        assert!(result.is_ok(), "cleanup failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn cleanup_aborts_when_live_record_has_different_uid() {
+        let cf = MockCloudflare::start(
+            200,
+            r#"{"success":true,"errors":[],"messages":[],"result":{"id":"new-rec"}}"#,
+        );
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        let cached = sample_record(None);
+        let mut live = sample_record(Some(CloudflareDNSRecordStatus {
+            record_id: "new-rec".to_string(),
+            zone_id: "zone-1".to_string(),
+            pending: false,
+            conditions: None,
+        }));
+        live.metadata.uid = Some("uid-2".to_string());
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((_request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(cached), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert!(
+            cf_requests.is_empty(),
+            "must not delete replacement record: {cf_requests:?}"
+        );
+        assert!(matches!(result, Err(ReconcileError::Other(_))));
+    }
+
+    #[tokio::test]
+    async fn cleanup_returns_rate_limit_error_on_cloudflare_429() {
+        let cf = MockCloudflare::start(
+            429,
+            r#"{"success":false,"errors":[{"code":10000,"message":"rate limited"}],"messages":[],"result":null}"#,
+        );
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        let live = sample_record(Some(CloudflareDNSRecordStatus {
+            record_id: "rec-1".to_string(),
+            zone_id: "zone-1".to_string(),
+            pending: false,
+            conditions: None,
+        }));
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            while let Some((_request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                respond.send_response(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(live_json.clone().into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_cleanup = async move { cleanup(Arc::new(live), ctx).await };
+        let (result, ()) = tokio::join!(run_cleanup, mock_api);
+
+        let cf_requests = cf.finish();
+        assert_eq!(cf_requests, vec!["DELETE /zones/zone-1/dns_records/rec-1"]);
+        match result {
+            Err(ReconcileError::Other(err)) => {
+                assert!(cloudflare::is_cloudflare_rate_limit(&err), "expected 429: {err:?}");
+            }
+            other => panic!("expected rate-limit error, got: {other:?}"),
+        }
     }
 }
