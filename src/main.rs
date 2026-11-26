@@ -156,9 +156,6 @@ async fn reconcile(
                 reconcile::ReconcileError::Kube(kube::Error::Api(err)) if err.code == 404 => {
                     warn!("Object not found when reconciling object: {err}");
                 }
-                reconcile::ReconcileError::Deletion(err) => {
-                    error!("Failed to delete object: {err:?}");
-                }
                 err => {
                     return Err(err);
                 }

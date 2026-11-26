@@ -23,7 +23,6 @@ use kube::{
         Patch,
         PatchParams,
     },
-    runtime::wait,
     Api,
 };
 use serde::{
@@ -36,9 +35,6 @@ use std::sync::Arc;
 pub enum ReconcileError {
     #[error(transparent)]
     Kube(#[from] kube::Error),
-
-    #[error(transparent)]
-    Deletion(#[from] wait::delete::Error),
 
     #[error(transparent)]
     Other(#[from] eyre::Error),
@@ -60,17 +56,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
 
     info!("processing reconcile request");
 
-    // If a record exists with a different name, we need to delete it first.
     let domain_or_record_text = resource.spec.name.as_str();
-    let api = Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns);
-    if let Some(existing) = api.get_opt(name).await? {
-        if existing.spec.name != domain_or_record_text {
-            warn!(
-                "conflict: CloudflareDNSRecord {ns}/{name} already exists with a different name, deleting old record"
-            );
-            wait::delete::delete_and_finalize(api, name, &Default::default()).await?;
-        }
-    }
 
     let Some(content) = resource.spec.lookup_content(client, ns).await? else {
         let msg = format!("unable to resolve content for CloudflareDNSRecord {ns}/{name}");
@@ -289,5 +275,109 @@ mod tests {
 
         // main.rs logs this error as a warning
         assert!(matches!(result, Err(ReconcileError::Kube(kube::Error::Api(err))) if err.code == 404));
+    }
+
+    #[tokio::test]
+    async fn apply_does_not_delete_record_when_cache_has_stale_name() {
+        // regression: apply fetched the live record and deleted it when its spec.name differed from the cached copy,
+        // then waited forever for the finalizer that only this controller removes
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::new(String::new()),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        });
+
+        // A Service without a public IP makes apply stop with a "missing content" status before it calls Cloudflare,
+        // so this test needs no Cloudflare mock.
+        let cached_spec = json!({
+            "name": "old.example.com",
+            "content": { "service": { "name": "web-svc" } },
+            "zone": { "id": { "value": "zone" } }
+        });
+        let mut cached = CloudflareDNSRecord::new("web", serde_json::from_value(cached_spec).unwrap());
+        cached.metadata.namespace = Some("app".to_string());
+        cached.metadata.uid = Some("uid-1".to_string());
+        cached.metadata.finalizers = Some(vec!["dns.cloudflare.com/delete-dns-record".to_string()]);
+
+        let mut live = cached.clone();
+        live.spec.name = "new.example.com".to_string();
+        let live_json = serde_json::to_string(&live).unwrap();
+
+        let mock_api = async {
+            let mut saw_delete = false;
+            let mut saw_status_patch = false;
+            while let Some((request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out waiting for request")
+            {
+                let path = request.uri().path();
+                match (request.method(), path) {
+                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web") => {
+                        respond.send_response(
+                            Response::builder()
+                                .status(200)
+                                .body(Body::from(live_json.clone().into_bytes()))
+                                .unwrap(),
+                        );
+                    }
+                    (&Method::DELETE, "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web") => {
+                        saw_delete = true;
+                        let err = json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "reason": "InternalError",
+                            "code": 500,
+                            "message": "unexpected self-delete"
+                        });
+                        respond.send_response(
+                            Response::builder()
+                                .status(500)
+                                .body(Body::from(err.to_string().into_bytes()))
+                                .unwrap(),
+                        );
+                    }
+                    (&Method::GET, "/api/v1/namespaces/app/services/web-svc") => {
+                        let svc = json!({
+                            "apiVersion": "v1",
+                            "kind": "Service",
+                            "metadata": { "name": "web-svc", "namespace": "app" },
+                            "spec": { "type": "ClusterIP" }
+                        });
+                        respond.send_response(
+                            Response::builder()
+                                .status(200)
+                                .body(Body::from(svc.to_string().into_bytes()))
+                                .unwrap(),
+                        );
+                    }
+                    (
+                        &Method::PATCH,
+                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web/status",
+                    ) => {
+                        saw_status_patch = true;
+                        respond.send_response(
+                            Response::builder()
+                                .status(200)
+                                .body(Body::from(live_json.clone().into_bytes()))
+                                .unwrap(),
+                        );
+                    }
+                    (method, path) => panic!("unexpected request: {method} {path}"),
+                }
+            }
+            (saw_delete, saw_status_patch)
+        };
+
+        let run_apply = async move { apply(Arc::new(cached), ctx).await };
+        let (result, (saw_delete, saw_status_patch)) = tokio::join!(run_apply, mock_api);
+
+        assert!(!saw_delete, "apply must not delete the record it reconciles");
+        assert!(saw_status_patch, "apply should write status instead of deleting");
+        assert!(result.is_ok(), "apply returned error: {result:?}");
     }
 }
