@@ -11,6 +11,8 @@ metadata:
   namespace: cloudflare-dns
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: cloudflare-dns-operator

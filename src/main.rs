@@ -113,7 +113,7 @@ async fn run_controller(
         do_dns_check: dns_checks.is_some(),
         dns_check_tx,
         dns_lookup_success: Default::default(),
-        records_store: Default::default(),
+        reconcile_lock: Default::default(),
     });
 
     let dns_change = dns_check::start_dns_check(context.clone(), dns_check_rx, dns_checks, nameserver);
@@ -122,7 +122,6 @@ async fn run_controller(
 
     let controller = Controller::new(dns_resources, Default::default());
     let records = controller.store();
-    let _ = context.records_store.set(records.clone());
 
     controller
         // when a service changes, e.g. gets a new public ip, reconcile the records whose content comes from it

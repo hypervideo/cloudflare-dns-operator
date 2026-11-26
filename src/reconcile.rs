@@ -51,6 +51,8 @@ struct AnnotationContent {
 }
 
 pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<(), ReconcileError> {
+    let _reconcile_guard = ctx.reconcile_lock.lock().await;
+
     let client = &ctx.client;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
@@ -69,9 +71,9 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         return Ok(());
     }
 
-    let is_new = live.status.is_none();
     let gen = live.metadata.generation;
     let old_status = live.status.clone();
+    let needs_initial_dns_check = old_status.as_ref().is_none_or(|status| status.record_id.is_empty());
     let domain_or_record_text = live.spec.name.as_str();
     let record_type = live.spec.ty.unwrap_or_default();
 
@@ -92,17 +94,72 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         return Ok(());
     };
 
+    let all_records = Api::<CloudflareDNSRecord>::all(client.clone())
+        .list(&ListParams::default())
+        .await?
+        .items;
+    let cf_records = ctx.cloudflare_api.list_dns_records(&zone_id).await?;
+
     let norm_name = normalize_dns_name(domain_or_record_text);
-    if let Some(owner) = find_conflicting_peer(&live, &zone_id, &norm_name, record_type, &content, &ctx).await? {
+    if let Some(owner) = find_conflicting_peer(
+        &live,
+        &zone_id,
+        &norm_name,
+        record_type,
+        &content,
+        &all_records,
+        &cf_records,
+        &ctx,
+    )
+    .await?
+    {
         let msg = format!("Cloudflare record {norm_name} ({record_type:?}) in zone {zone_id} conflicts with {owner}");
         warn!("{msg}");
-        update_conditions(&live, &ctx, vec![error_condition(&live, "NameConflict", msg, gen)]).await?;
+
+        // A refused record owns nothing: release any previous Cloudflare record it held (if unreferenced)
+        // and clear its status IDs so it cannot block peer cleanup or claim ownership in later tie-breaks.
+        if let Some(old) = old_status
+            .as_ref()
+            .filter(|status| !status.zone_id.is_empty() && !status.record_id.is_empty())
+        {
+            delete_cloudflare_record_if_unreferenced(&ctx, &live, &old.zone_id, &old.record_id, &all_records).await?;
+        }
+        let status = CloudflareDNSRecordStatus {
+            record_id: String::new(),
+            zone_id: String::new(),
+            pending: false,
+            conditions: Some(vec![error_condition(&live, "NameConflict", msg, gen)]),
+        };
+        write_status(&live, &ctx, status).await?;
         return Ok(());
+    }
+
+    // Delete-before-create on rename (zone, normalized name, or record type changed):
+    // - Allows changing between A/AAAA and CNAME at the same name (Cloudflare rejects creating the new type first).
+    // - Avoids leaking a newly created record if deleting the old record fails before status is updated.
+    if let Some(old) = old_status
+        .as_ref()
+        .filter(|status| !status.zone_id.is_empty() && !status.record_id.is_empty())
+    {
+        let moved_record = if old.zone_id != zone_id {
+            true
+        } else {
+            cf_records
+                .iter()
+                .find(|record| record.id == old.record_id)
+                .is_some_and(|old_cf| {
+                    normalize_dns_name(&old_cf.name) != norm_name
+                        || !old_cf.record_type.eq_ignore_ascii_case(record_type.as_str())
+                })
+        };
+        if moved_record {
+            delete_cloudflare_record_if_unreferenced(&ctx, &live, &old.zone_id, &old.record_id, &all_records).await?;
+        }
     }
 
     debug!("updating dns record for CloudflareDNSRecord {ns}/{name}");
 
-    let updated = ctx
+    let record = ctx
         .cloudflare_api
         .update_dns_record_and_wait(cloudflare::CreateRecordArgs {
             zone: Zone::Identifier(zone_id.clone()),
@@ -113,19 +170,6 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
             ttl: live.spec.ttl,
         })
         .await?;
-
-    // If this record moved to a different Cloudflare record (for example after a spec.name, type, or zone edit),
-    // clean up the previous Cloudflare record before overwriting status so transient delete errors retry cleanly.
-    if let Some(old) = old_status
-        .as_ref()
-        .filter(|status| !status.zone_id.is_empty() && !status.record_id.is_empty())
-    {
-        let record_changed = old.zone_id != zone_id || old.record_id != updated.record.id;
-        let already_deleted = old.zone_id == zone_id && updated.deleted_ids.iter().any(|id| id == &old.record_id);
-        if record_changed && !already_deleted {
-            delete_cloudflare_record_if_unreferenced(&ctx, &live, &old.zone_id, &old.record_id).await?;
-        }
-    }
 
     // -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
@@ -152,13 +196,13 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         // We are storing the details about how we created the record in the
         // status. At deletion time, the configmap / secrets we got the
         // zone_id from might be gone already.
-        record_id: updated.record.id,
+        record_id: record.id,
         zone_id,
         pending,
         conditions: Some(vec![condition]),
     };
 
-    if is_new && ctx.do_dns_check {
+    if needs_initial_dns_check && ctx.do_dns_check {
         let _ = ctx
             .dns_check_tx
             .send(DnsCheckRequest::CheckSingleRecord {
@@ -176,6 +220,8 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
 /// and retries.
 #[instrument(level = "debug", skip_all)]
 pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Result<(), ReconcileError> {
+    let _reconcile_guard = ctx.reconcile_lock.lock().await;
+
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
 
@@ -208,7 +254,11 @@ pub async fn cleanup(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> R
         return Ok(());
     };
 
-    delete_cloudflare_record_if_unreferenced(&ctx, &live, &status.zone_id, &status.record_id).await?;
+    let all_records = Api::<CloudflareDNSRecord>::all(ctx.client.clone())
+        .list(&ListParams::default())
+        .await?
+        .items;
+    delete_cloudflare_record_if_unreferenced(&ctx, &live, &status.zone_id, &status.record_id, &all_records).await?;
 
     Ok(())
 }
@@ -242,30 +292,44 @@ fn is_same_record(a: &CloudflareDNSRecord, b: &CloudflareDNSRecord) -> bool {
     }
 }
 
-fn owns_live_record_in_zone(record: &CloudflareDNSRecord, zone_id: &str) -> bool {
-    record
-        .status
-        .as_ref()
-        .is_some_and(|status| status.zone_id == zone_id && !status.record_id.is_empty())
+fn cf_type_conflicts_with(cf_type: &str, record_type: RecordType) -> bool {
+    cf_type.eq_ignore_ascii_case(record_type.as_str())
+        || matches!(record_type, RecordType::CNAME)
+        || cf_type.eq_ignore_ascii_case("CNAME")
 }
 
-/// Deterministic total order for breaking content conflicts on the same `(zone_id, name, type)`.
-/// Lower rank wins: an existing owner in the zone beats a newcomer, then oldest `creationTimestamp`,
-/// then `namespace`, `name`, `uid`.
-fn conflict_rank<'a>(
-    record: &'a CloudflareDNSRecord,
+fn owned_cf_record<'a>(
+    record: &CloudflareDNSRecord,
     zone_id: &str,
-) -> (
+    name_cf_records: &[&'a cloudflare::DnsRecordInfo],
+) -> Option<&'a cloudflare::DnsRecordInfo> {
+    let status = record.status.as_ref()?;
+    if status.zone_id != zone_id || status.record_id.is_empty() {
+        return None;
+    }
+    name_cf_records.iter().copied().find(|cf| cf.id == status.record_id)
+}
+
+type ConflictRank<'a> = (
+    bool,
     bool,
     bool,
     Option<chrono::DateTime<chrono::Utc>>,
     &'a str,
     &'a str,
     &'a str,
-) {
+);
+
+/// Deterministic total order for breaking conflicts at `(zone_id, norm_name)`.
+/// Lower rank wins:
+/// 1. Matches the record (type + content) that Cloudflare currently serves at this name.
+/// 2. Holds `status.record_id` pointing to one of those live Cloudflare records at this name.
+/// 3. Oldest `creationTimestamp`, then `namespace`, `name`, `uid`.
+fn conflict_rank(record: &CloudflareDNSRecord, matches_cf_now: bool, owns_this_cf_record: bool) -> ConflictRank<'_> {
     let created = record.metadata.creation_timestamp.as_ref().map(|t| t.0);
     (
-        !owns_live_record_in_zone(record, zone_id),
+        !matches_cf_now,
+        !owns_this_cf_record,
         created.is_none(),
         created,
         record.metadata.namespace.as_deref().unwrap_or("default"),
@@ -274,78 +338,133 @@ fn conflict_rank<'a>(
     )
 }
 
-/// Checks whether another live (non-deleting) `CloudflareDNSRecord` in the cluster claims the same
-/// `(zone_id, norm_name, record_type)` with different content and outranks `live`.
-/// Peers with identical content are allowed to share the same Cloudflare record.
+/// Evaluates all live (non-deleting) claimants for `(zone_id, norm_name)` whose record type conflicts with
+/// `record_type`, picks the single best-ranked winner, and returns `Some(winner_label)` if `live`'s
+/// `(record_type, content)` differs from the winner.
+/// Peers with identical `(record_type, content)` as the winner share the same Cloudflare record.
+#[allow(clippy::too_many_arguments)]
 async fn find_conflicting_peer(
     live: &CloudflareDNSRecord,
     zone_id: &str,
     norm_name: &str,
     record_type: RecordType,
     content: &str,
+    all_records: &[CloudflareDNSRecord],
+    cf_records: &[cloudflare::DnsRecordInfo],
     ctx: &Context,
 ) -> Result<Option<String>, ReconcileError> {
-    if let Some(store) = ctx.records_store.get() {
-        let has_candidate = store.state().iter().any(|peer| {
-            !is_same_record(live, peer)
-                && peer.metadata.deletion_timestamp.is_none()
-                && normalize_dns_name(&peer.spec.name) == norm_name
-                && peer.spec.ty.unwrap_or_default() == record_type
-        });
-        if !has_candidate {
-            return Ok(None);
-        }
+    struct Claimant<'a> {
+        label: String,
+        record_type: RecordType,
+        content: String,
+        rank: ConflictRank<'a>,
     }
 
-    let all = Api::<CloudflareDNSRecord>::all(ctx.client.clone())
-        .list(&ListParams::default())
-        .await?;
+    let name_cf_records: Vec<&cloudflare::DnsRecordInfo> = cf_records
+        .iter()
+        .filter(|cf| normalize_dns_name(&cf.name) == norm_name && cf_type_conflicts_with(&cf.record_type, record_type))
+        .collect();
 
     let self_ns = live.metadata.namespace.as_deref().unwrap_or("default");
     let self_name = live.metadata.name.as_deref().unwrap_or("");
-    let self_rank = conflict_rank(live, zone_id);
+    let self_owns = owned_cf_record(live, zone_id, &name_cf_records).is_some();
+    let self_matches_cf = name_cf_records
+        .iter()
+        .any(|cf| cf.record_type.eq_ignore_ascii_case(record_type.as_str()) && cf.content == content);
 
-    for peer in all {
-        if is_same_record(live, &peer) || peer.metadata.deletion_timestamp.is_some() {
+    let mut claimants = vec![Claimant {
+        label: format!("{self_ns}/{self_name}"),
+        record_type,
+        content: content.to_string(),
+        rank: conflict_rank(live, self_matches_cf, self_owns),
+    }];
+
+    for peer in all_records {
+        if is_same_record(live, peer) || peer.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        if normalize_dns_name(&peer.spec.name) != norm_name || peer.spec.ty.unwrap_or_default() != record_type {
+        let peer_type = peer.spec.ty.unwrap_or_default();
+        if normalize_dns_name(&peer.spec.name) != norm_name || !record_type.conflicts_with(peer_type) {
             continue;
         }
 
         let peer_ns = peer.metadata.namespace.as_deref().unwrap_or("default");
         let peer_name = peer.metadata.name.as_deref().unwrap_or("");
+        let peer_cf = owned_cf_record(peer, zone_id, &name_cf_records);
 
-        let peer_zone_id = match resolve_zone_id(&peer.spec.zone, &ctx.client, peer_ns, &ctx.cloudflare_api).await {
-            Ok(Some(id)) => Some(id),
-            Ok(None) | Err(_) => peer
-                .status
-                .as_ref()
-                .filter(|status| !status.zone_id.is_empty())
-                .map(|status| status.zone_id.clone()),
-        };
-        if peer_zone_id.as_deref() != Some(zone_id) {
-            continue;
+        match resolve_zone_id(&peer.spec.zone, &ctx.client, peer_ns, &ctx.cloudflare_api).await {
+            Ok(Some(id)) if id != zone_id => continue,
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let status_in_zone = peer
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.zone_id == zone_id && !status.record_id.is_empty());
+                if peer_cf.is_none() && !status_in_zone {
+                    continue;
+                }
+            }
+            Err(err) => {
+                // Fail closed unless `live` already owns and matches the live Cloudflare record while `peer` does not.
+                if peer_cf.is_some() || !(self_owns && self_matches_cf) {
+                    return Err(err);
+                }
+                debug!("ignoring unresolvable non-owner peer {peer_ns}/{peer_name}: {err}");
+                continue;
+            }
         }
 
         let peer_content = match peer.spec.lookup_content(&ctx.client, peer_ns).await {
             Ok(Some(value)) => value,
-            Ok(None) => continue,
+            Ok(None) => {
+                if let Some(cf) = peer_cf {
+                    cf.content.clone()
+                } else {
+                    continue;
+                }
+            }
             Err(err) => {
-                debug!("skipping peer {peer_ns}/{peer_name} while checking name conflicts: {err}");
+                if peer_cf.is_some() || !(self_owns && self_matches_cf) {
+                    return Err(err.into());
+                }
+                debug!("ignoring unresolvable non-owner peer {peer_ns}/{peer_name}: {err}");
                 continue;
             }
         };
 
-        if peer_content == content {
-            warn!(
-                "CloudflareDNSRecord {self_ns}/{self_name} shares {norm_name} ({record_type:?}) in zone {zone_id} with {peer_ns}/{peer_name}"
-            );
-            continue;
-        }
+        let peer_matches_cf = name_cf_records
+            .iter()
+            .any(|cf| cf.record_type.eq_ignore_ascii_case(peer_type.as_str()) && cf.content == peer_content);
 
-        if conflict_rank(&peer, zone_id) < self_rank {
-            return Ok(Some(format!("{peer_ns}/{peer_name}")));
+        claimants.push(Claimant {
+            label: format!("{peer_ns}/{peer_name}"),
+            record_type: peer_type,
+            content: peer_content,
+            rank: conflict_rank(peer, peer_matches_cf, peer_cf.is_some()),
+        });
+    }
+
+    let winner = claimants
+        .iter()
+        .min_by_key(|claimant| claimant.rank)
+        .expect("claimants always contains live");
+
+    if winner.record_type != record_type || winner.content != content {
+        return Ok(Some(winner.label.clone()));
+    }
+
+    if claimants.len() > 1 {
+        let peers: Vec<&str> = claimants
+            .iter()
+            .skip(1)
+            .filter(|c| c.record_type == record_type && c.content == content)
+            .map(|c| c.label.as_str())
+            .collect();
+        if !peers.is_empty() {
+            warn!(
+                "CloudflareDNSRecord {self_ns}/{self_name} shares {norm_name} ({record_type:?}) in zone {zone_id} with {}",
+                peers.join(", ")
+            );
         }
     }
 
@@ -359,12 +478,9 @@ async fn delete_cloudflare_record_if_unreferenced(
     self_rec: &CloudflareDNSRecord,
     zone_id: &str,
     record_id: &str,
-) -> Result<bool, ReconcileError> {
-    let all = Api::<CloudflareDNSRecord>::all(ctx.client.clone())
-        .list(&ListParams::default())
-        .await?;
-
-    if let Some(peer) = all.into_iter().find(|peer| {
+    all_records: &[CloudflareDNSRecord],
+) -> Result<(), ReconcileError> {
+    if let Some(peer) = all_records.iter().find(|peer| {
         !is_same_record(self_rec, peer)
             && peer.metadata.deletion_timestamp.is_none()
             && peer
@@ -377,11 +493,11 @@ async fn delete_cloudflare_record_if_unreferenced(
         info!(
             "Cloudflare record {zone_id}/{record_id} is still referenced by {peer_ns}/{peer_name}, skipping Cloudflare delete"
         );
-        return Ok(false);
+        return Ok(());
     }
 
     ctx.cloudflare_api.delete_dns_record(zone_id, record_id).await?;
-    Ok(true)
+    Ok(())
 }
 
 pub async fn update_conditions(
@@ -439,6 +555,7 @@ async fn write_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cloudflare::MockCloudflare;
     use http::{
         Method,
         Request,
@@ -458,7 +575,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         };
         let spec =
             json!({ "name": "example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone" } } });
@@ -498,7 +615,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         });
 
         // A Service without a public IP makes apply stop with a "missing content" status before it calls Cloudflare,
@@ -592,95 +709,6 @@ mod tests {
         assert!(result.is_ok(), "apply returned error: {result:?}");
     }
 
-    struct MockCloudflare {
-        base_url: String,
-        requests: Arc<std::sync::Mutex<Vec<String>>>,
-        stop: Arc<std::sync::atomic::AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl MockCloudflare {
-        fn start(status: u16, body: &'static str) -> Self {
-            Self::with_handler(move |_method, _path| (status, body.to_string()))
-        }
-
-        fn with_handler(handler: impl Fn(&str, &str) -> (u16, String) + Send + 'static) -> Self {
-            use std::{
-                io::{
-                    Read as _,
-                    Write as _,
-                },
-                sync::atomic::Ordering,
-                time::Duration,
-            };
-
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let base_url = format!("http://{}", listener.local_addr().unwrap());
-            listener.set_nonblocking(true).unwrap();
-
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let reqs = requests.clone();
-            let stop_flag = stop.clone();
-
-            let handle = std::thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
-                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                            let mut buf = [0u8; 4096];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            let req_text = String::from_utf8_lossy(&buf[..n]);
-                            let first_line = req_text.lines().next().unwrap_or("");
-                            let mut parts = first_line.split_whitespace();
-                            let method = parts.next().unwrap_or("");
-                            let path = parts.next().unwrap_or("");
-                            if !method.is_empty() && !path.is_empty() {
-                                reqs.lock().unwrap().push(format!("{method} {path}"));
-                            }
-                            let (status, body) = handler(method, path);
-                            let resp = format!(
-                                "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
-                            let _ = stream.write_all(resp.as_bytes());
-                            let _ = stream.flush();
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            Self {
-                base_url,
-                requests,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        fn finish(mut self) -> Vec<String> {
-            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                handle.join().unwrap();
-            }
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    impl Drop for MockCloudflare {
-        fn drop(&mut self) {
-            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
     fn sample_record(status: Option<CloudflareDNSRecordStatus>) -> CloudflareDNSRecord {
         let spec = json!({
             "name": "app.example.com",
@@ -718,7 +746,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         });
 
         let empty_list = json!({
@@ -947,7 +975,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         };
 
         let cached = sample_record(None);
@@ -1015,7 +1043,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         });
 
         let mut deleting = sample_record(Some(sample_status("zone-1", "rec-1")));
@@ -1119,7 +1147,7 @@ mod tests {
             do_dns_check: false,
             dns_check_tx: tokio::sync::mpsc::channel(1).0,
             dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+            reconcile_lock: Default::default(),
         });
 
         let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now());
@@ -1183,15 +1211,16 @@ mod tests {
 
     #[tokio::test]
     async fn apply_refuses_conflicting_content_for_same_name_and_type() {
-        let cf = MockCloudflare::start(500, r#"{"success":false,"errors":[],"messages":[],"result":null}"#);
-        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
-        let ctx = Arc::new(Context {
-            client: kube::Client::new(service, "default"),
-            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
-            do_dns_check: false,
-            dns_check_tx: tokio::sync::mpsc::channel(1).0,
-            dns_lookup_success: Default::default(),
-            records_store: Default::default(),
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-1", "app.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            other => panic!("conflicting record must not send Cloudflare {other}"),
         });
 
         let owner = named_record(
@@ -1202,71 +1231,10 @@ mod tests {
             Some(sample_status("zone-1", "rec-1")),
         );
         let intruder = named_record("intruder", "uid-intruder", "APP.EXAMPLE.COM.", "9.9.9.9", None);
-        let intruder_json = serde_json::to_string(&intruder).unwrap();
-        let list_json = json!({
-            "apiVersion": "dns.cloudflare.com/v1alpha1",
-            "kind": "CloudflareDNSRecordList",
-            "metadata": {},
-            "items": [&owner, &intruder]
-        })
-        .to_string();
+        let (result, patched_status, cf_requests) = run_apply_test(intruder.clone(), vec![owner, intruder], cf).await;
 
-        let mock_api = async {
-            let mut patched_status = None;
-            while let Some((request, respond)) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
-                    .await
-                    .expect("api server timed out")
-            {
-                match (request.method(), request.uri().path()) {
-                    (
-                        &Method::GET,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/intruder",
-                    ) => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(intruder_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(list_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (
-                        &Method::PATCH,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/intruder/status",
-                    ) => {
-                        let bytes = request.into_body().collect_bytes().await.unwrap();
-                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        patched_status = body.get("status").cloned();
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(intruder_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (method, path) => panic!("unexpected request: {method} {path}"),
-                }
-            }
-            patched_status
-        };
-
-        let run_apply = async move { apply(Arc::new(intruder), ctx).await };
-        let (result, patched_status) = tokio::join!(run_apply, mock_api);
-
-        let cf_requests = cf.finish();
         assert!(result.is_ok(), "apply failed: {result:?}");
-        assert!(
-            cf_requests.is_empty(),
-            "conflicting record must not touch Cloudflare: {cf_requests:?}"
-        );
+        assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
         let status = patched_status.expect("expected NameConflict status patch");
         assert_eq!(status["record_id"], "");
         assert_eq!(status["zone_id"], "");
@@ -1288,16 +1256,6 @@ mod tests {
             other => panic!("unexpected Cloudflare request: {other}"),
         });
 
-        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
-        let ctx = Arc::new(Context {
-            client: kube::Client::new(service, "default"),
-            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
-            do_dns_check: false,
-            dns_check_tx: tokio::sync::mpsc::channel(1).0,
-            dns_lookup_success: Default::default(),
-            records_store: Default::default(),
-        });
-
         let existing = named_record(
             "pr-1-admin-dns",
             "uid-old",
@@ -1306,66 +1264,9 @@ mod tests {
             Some(sample_status("zone-1", "rec-1")),
         );
         let newcomer = named_record("pr-1-admin", "uid-new", "pr-1-admin.dev.hyper.video", "1.2.3.4", None);
-        let newcomer_json = serde_json::to_string(&newcomer).unwrap();
-        let list_json = json!({
-            "apiVersion": "dns.cloudflare.com/v1alpha1",
-            "kind": "CloudflareDNSRecordList",
-            "metadata": {},
-            "items": [&existing, &newcomer]
-        })
-        .to_string();
+        let (result, patched_status, cf_requests) =
+            run_apply_test(newcomer.clone(), vec![existing, newcomer], cf).await;
 
-        let mock_api = async {
-            let mut patched_status = None;
-            while let Some((request, respond)) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
-                    .await
-                    .expect("api server timed out")
-            {
-                match (request.method(), request.uri().path()) {
-                    (
-                        &Method::GET,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/pr-1-admin",
-                    ) => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(newcomer_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(list_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (
-                        &Method::PATCH,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/pr-1-admin/status",
-                    ) => {
-                        let bytes = request.into_body().collect_bytes().await.unwrap();
-                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        patched_status = body.get("status").cloned();
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(newcomer_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (method, path) => panic!("unexpected request: {method} {path}"),
-                }
-            }
-            patched_status
-        };
-
-        let run_apply = async move { apply(Arc::new(newcomer), ctx).await };
-        let (result, patched_status) = tokio::join!(run_apply, mock_api);
-
-        let cf_requests = cf.finish();
         assert!(result.is_ok(), "apply failed: {result:?}");
         assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
         let status = patched_status.expect("expected Ready status patch");
@@ -1383,6 +1284,7 @@ mod tests {
             "result": [cf_record_json("rec-old", "old.example.com", "A", "1.2.3.4")]
         })
         .to_string();
+        let empty_cf = r#"{"success":true,"errors":[],"messages":[],"result":[]}"#.to_string();
         let create_cf = json!({
             "success": true,
             "errors": [],
@@ -1391,22 +1293,23 @@ mod tests {
         })
         .to_string();
         let delete_cf = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-old"}}"#.to_string();
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_flag = deleted.clone();
 
         let cf = MockCloudflare::with_handler(move |method, _path| match method {
-            "GET" => (200, list_cf.clone()),
+            "GET" => {
+                if deleted_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    (200, empty_cf.clone())
+                } else {
+                    (200, list_cf.clone())
+                }
+            }
+            "DELETE" => {
+                deleted_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                (200, delete_cf.clone())
+            }
             "POST" => (200, create_cf.clone()),
-            "DELETE" => (200, delete_cf.clone()),
             other => panic!("unexpected Cloudflare request: {other}"),
-        });
-
-        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
-        let ctx = Arc::new(Context {
-            client: kube::Client::new(service, "default"),
-            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
-            do_dns_check: false,
-            dns_check_tx: tokio::sync::mpsc::channel(1).0,
-            dns_lookup_success: Default::default(),
-            records_store: Default::default(),
         });
 
         let renamed = named_record(
@@ -1416,70 +1319,16 @@ mod tests {
             "1.2.3.4",
             Some(sample_status("zone-1", "rec-old")),
         );
-        let renamed_json = serde_json::to_string(&renamed).unwrap();
-        let list_json = json!({
-            "apiVersion": "dns.cloudflare.com/v1alpha1",
-            "kind": "CloudflareDNSRecordList",
-            "metadata": {},
-            "items": [&renamed]
-        })
-        .to_string();
+        let (result, patched_status, cf_requests) = run_apply_test(renamed.clone(), vec![renamed], cf).await;
 
-        let mock_api = async {
-            let mut patched_status = None;
-            while let Some((request, respond)) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
-                    .await
-                    .expect("api server timed out")
-            {
-                match (request.method(), request.uri().path()) {
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(renamed_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(list_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (
-                        &Method::PATCH,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web/status",
-                    ) => {
-                        let bytes = request.into_body().collect_bytes().await.unwrap();
-                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        patched_status = body.get("status").cloned();
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(renamed_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (method, path) => panic!("unexpected request: {method} {path}"),
-                }
-            }
-            patched_status
-        };
-
-        let run_apply = async move { apply(Arc::new(renamed), ctx).await };
-        let (result, patched_status) = tokio::join!(run_apply, mock_api);
-
-        let cf_requests = cf.finish();
         assert!(result.is_ok(), "apply failed: {result:?}");
         assert_eq!(
             cf_requests,
             vec![
                 "GET /zones/zone-1/dns_records?page=1",
-                "POST /zones/zone-1/dns_records",
                 "DELETE /zones/zone-1/dns_records/rec-old",
+                "GET /zones/zone-1/dns_records?page=1",
+                "POST /zones/zone-1/dns_records",
             ]
         );
         let status = patched_status.expect("expected status patch");
@@ -1509,16 +1358,6 @@ mod tests {
             other => panic!("unexpected Cloudflare request: {other}"),
         });
 
-        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
-        let ctx = Arc::new(Context {
-            client: kube::Client::new(service, "default"),
-            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
-            do_dns_check: false,
-            dns_check_tx: tokio::sync::mpsc::channel(1).0,
-            dns_lookup_success: Default::default(),
-            records_store: Default::default(),
-        });
-
         let renamed = named_record(
             "web",
             "uid-1",
@@ -1533,14 +1372,60 @@ mod tests {
             "1.2.3.4",
             Some(sample_status("zone-1", "rec-old")),
         );
-        let renamed_json = serde_json::to_string(&renamed).unwrap();
+        let (result, patched_status, cf_requests) = run_apply_test(renamed.clone(), vec![renamed, peer], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(
+            cf_requests,
+            vec!["GET /zones/zone-1/dns_records?page=1", "POST /zones/zone-1/dns_records"]
+        );
+        let status = patched_status.expect("expected status patch");
+        assert_eq!(status["record_id"], "rec-new");
+    }
+
+    fn record_with_spec(
+        name: &str,
+        uid: &str,
+        created_secs: i64,
+        spec: serde_json::Value,
+        status: Option<CloudflareDNSRecordStatus>,
+    ) -> CloudflareDNSRecord {
+        let mut record = CloudflareDNSRecord::new(name, serde_json::from_value(spec).unwrap());
+        record.metadata.namespace = Some("app".to_string());
+        record.metadata.uid = Some(uid.to_string());
+        record.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            chrono::DateTime::from_timestamp(created_secs, 0).unwrap(),
+        ));
+        record.status = status;
+        record
+    }
+
+    async fn run_apply_test(
+        target: CloudflareDNSRecord,
+        all_items: Vec<CloudflareDNSRecord>,
+        cf: MockCloudflare,
+    ) -> (Result<(), ReconcileError>, Option<serde_json::Value>, Vec<String>) {
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+            reconcile_lock: Default::default(),
+        });
+
+        let target_name = target.metadata.name.clone().unwrap();
+        let target_json = serde_json::to_string(&target).unwrap();
         let list_json = json!({
             "apiVersion": "dns.cloudflare.com/v1alpha1",
             "kind": "CloudflareDNSRecordList",
             "metadata": {},
-            "items": [&renamed, &peer]
+            "items": all_items
         })
         .to_string();
+        let get_path = format!("/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/{target_name}");
+        let patch_path = format!("{get_path}/status");
 
         let mock_api = async {
             let mut patched_status = None;
@@ -1549,53 +1434,468 @@ mod tests {
                     .await
                     .expect("api server timed out")
             {
-                match (request.method(), request.uri().path()) {
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(renamed_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords") => {
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(list_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (
-                        &Method::PATCH,
-                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web/status",
-                    ) => {
-                        let bytes = request.into_body().collect_bytes().await.unwrap();
-                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        patched_status = body.get("status").cloned();
-                        respond.send_response(
-                            Response::builder()
-                                .status(200)
-                                .body(Body::from(renamed_json.clone().into_bytes()))
-                                .unwrap(),
-                        );
-                    }
-                    (method, path) => panic!("unexpected request: {method} {path}"),
+                let path = request.uri().path();
+                if request.method() == Method::GET && path == get_path {
+                    respond.send_response(
+                        Response::builder()
+                            .status(200)
+                            .body(Body::from(target_json.clone().into_bytes()))
+                            .unwrap(),
+                    );
+                } else if request.method() == Method::GET
+                    && path == "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords"
+                {
+                    respond.send_response(
+                        Response::builder()
+                            .status(200)
+                            .body(Body::from(list_json.clone().into_bytes()))
+                            .unwrap(),
+                    );
+                } else if request.method() == Method::PATCH && path == patch_path {
+                    let bytes = request.into_body().collect_bytes().await.unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    patched_status = body.get("status").cloned();
+                    respond.send_response(
+                        Response::builder()
+                            .status(200)
+                            .body(Body::from(target_json.clone().into_bytes()))
+                            .unwrap(),
+                    );
+                } else {
+                    panic!("unexpected request: {} {}", request.method(), path);
                 }
             }
             patched_status
         };
 
-        let run_apply = async move { apply(Arc::new(renamed), ctx).await };
+        let run_apply = async move { apply(Arc::new(target), ctx).await };
         let (result, patched_status) = tokio::join!(run_apply, mock_api);
+        (result, patched_status, cf.finish())
+    }
 
-        let cf_requests = cf.finish();
+    #[tokio::test]
+    async fn apply_refuses_older_record_renamed_onto_name_owned_by_newer_record() {
+        // Older record O owned a.example.com (rec-a) and was renamed onto b.example.com owned by newer N (rec-b).
+        // N must keep rec-b; O must get NameConflict, delete its old rec-a, and clear its status IDs.
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [
+                cf_record_json("rec-a", "a.example.com", "A", "1.1.1.1"),
+                cf_record_json("rec-b", "b.example.com", "A", "2.2.2.2"),
+            ]
+        })
+        .to_string();
+        let delete_cf = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-a"}}"#.to_string();
+        let cf = MockCloudflare::with_handler(move |method, path| match (method, path) {
+            ("GET", _) => (200, list_cf.clone()),
+            ("DELETE", "/zones/zone-1/dns_records/rec-a") => (200, delete_cf.clone()),
+            other => panic!("unexpected Cloudflare request: {other:?}"),
+        });
+
+        let older_renamed = record_with_spec(
+            "old-rec",
+            "uid-old",
+            100,
+            json!({ "name": "b.example.com", "content": { "value": "1.1.1.1" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-a")),
+        );
+        let newer_owner = record_with_spec(
+            "new-rec",
+            "uid-new",
+            200,
+            json!({ "name": "b.example.com", "content": { "value": "2.2.2.2" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-b")),
+        );
+
+        let (result, patched_status, cf_requests) =
+            run_apply_test(older_renamed.clone(), vec![older_renamed, newer_owner], cf).await;
+
         assert!(result.is_ok(), "apply failed: {result:?}");
         assert_eq!(
             cf_requests,
-            vec!["GET /zones/zone-1/dns_records?page=1", "POST /zones/zone-1/dns_records",]
+            vec![
+                "GET /zones/zone-1/dns_records?page=1",
+                "DELETE /zones/zone-1/dns_records/rec-a",
+            ]
+        );
+        let status = patched_status.expect("expected NameConflict status patch");
+        assert_eq!(status["record_id"], "");
+        assert_eq!(status["zone_id"], "");
+        assert_eq!(status["conditions"][0]["reason"], "NameConflict");
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_older_shared_record_when_its_content_changes() {
+        // Older A and newer B shared rec-1 (1.1.1.1). A's content changes to 9.9.9.9.
+        // B still matches what Cloudflare serves, so B wins; A gets NameConflict, clears its status IDs, and does
+        // NOT delete rec-1 because B still references it.
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-1", "shared.example.com", "A", "1.1.1.1")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            other => panic!("must not modify Cloudflare: {other}"),
+        });
+
+        let older_edited = record_with_spec(
+            "a",
+            "uid-a",
+            100,
+            json!({ "name": "shared.example.com", "content": { "value": "9.9.9.9" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-1")),
+        );
+        let newer_unchanged = record_with_spec(
+            "b",
+            "uid-b",
+            200,
+            json!({ "name": "shared.example.com", "content": { "value": "1.1.1.1" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-1")),
+        );
+
+        let (result, patched_status, cf_requests) =
+            run_apply_test(older_edited.clone(), vec![older_edited, newer_unchanged], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
+        let status = patched_status.expect("expected NameConflict status patch");
+        assert_eq!(status["record_id"], "");
+        assert_eq!(status["zone_id"], "");
+        assert_eq!(status["conditions"][0]["reason"], "NameConflict");
+    }
+
+    #[tokio::test]
+    async fn apply_fails_closed_when_peer_content_lookup_errors() {
+        // Peer A owns rec-1 via Service `web`. B claims the same name with literal 9.9.9.9.
+        // If GET Service `web` fails transiently (500), B must return Err and retry instead of replacing rec-1.
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-1", "app.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            other => panic!("must not write to Cloudflare on peer error: {other}"),
+        });
+
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Arc::new(Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::with_base_url("token".to_string(), &cf.base_url),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+            reconcile_lock: Default::default(),
+        });
+
+        let owner = record_with_spec(
+            "owner",
+            "uid-owner",
+            100,
+            json!({ "name": "app.example.com", "content": { "service": { "name": "web" } }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-1")),
+        );
+        let intruder = record_with_spec(
+            "intruder",
+            "uid-intruder",
+            200,
+            json!({ "name": "app.example.com", "content": { "value": "9.9.9.9" }, "zone": { "id": { "value": "zone-1" } } }),
+            None,
+        );
+        let intruder_json = serde_json::to_string(&intruder).unwrap();
+        let list_json = json!({
+            "apiVersion": "dns.cloudflare.com/v1alpha1",
+            "kind": "CloudflareDNSRecordList",
+            "metadata": {},
+            "items": [&owner, &intruder]
+        })
+        .to_string();
+        let svc_err = json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "reason": "InternalError",
+            "code": 500,
+            "message": "apiserver hiccup"
+        })
+        .to_string();
+
+        let mock_api = async {
+            while let Some((request, respond)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), api_server.next_request())
+                    .await
+                    .expect("api server timed out")
+            {
+                let (status, body) = match (request.method(), request.uri().path()) {
+                    (
+                        &Method::GET,
+                        "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/intruder",
+                    ) => (200, intruder_json.clone()),
+                    (&Method::GET, "/apis/dns.cloudflare.com/v1alpha1/cloudflarednsrecords") => {
+                        (200, list_json.clone())
+                    }
+                    (&Method::GET, "/api/v1/namespaces/app/services/web") => (500, svc_err.clone()),
+                    (method, path) => panic!("unexpected request: {method} {path}"),
+                };
+                respond.send_response(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(body.into_bytes()))
+                        .unwrap(),
+                );
+            }
+        };
+
+        let run_apply = async move { apply(Arc::new(intruder), ctx).await };
+        let (result, ()) = tokio::join!(run_apply, mock_api);
+
+        let cf_requests = cf.finish();
+        assert!(result.is_err(), "expected error to fail closed and retry: {result:?}");
+        assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
+    }
+
+    #[tokio::test]
+    async fn apply_allows_matching_third_claimant_despite_older_refused_claimant() {
+        // A owns rec-1 (1.2.3.4). B (older than C) wants 9.9.9.9 (refused). C (newer than B) wants 1.2.3.4.
+        // C matches the winner (A) and must be allowed to share rec-1.
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-1", "app.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            other => panic!("unexpected Cloudflare request: {other}"),
+        });
+
+        let owner_a = record_with_spec(
+            "a",
+            "uid-a",
+            100,
+            json!({ "name": "app.example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-1")),
+        );
+        let loser_b = record_with_spec(
+            "b",
+            "uid-b",
+            200,
+            json!({ "name": "app.example.com", "content": { "value": "9.9.9.9" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(CloudflareDNSRecordStatus::default()),
+        );
+        let matcher_c = record_with_spec(
+            "c",
+            "uid-c",
+            300,
+            json!({ "name": "app.example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone-1" } } }),
+            None,
+        );
+
+        let (result, patched_status, cf_requests) =
+            run_apply_test(matcher_c.clone(), vec![owner_a, loser_b, matcher_c], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
+        let status = patched_status.expect("expected Ready status patch");
+        assert_eq!(status["record_id"], "rec-1");
+        assert_eq!(status["conditions"][0]["status"], "True");
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_cname_conflicting_with_existing_a_record() {
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-a", "app.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            other => panic!("must not write conflicting CNAME: {other}"),
+        });
+
+        let a_owner = record_with_spec(
+            "a-rec",
+            "uid-a",
+            100,
+            json!({ "name": "app.example.com", "type": "A", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-a")),
+        );
+        let cname_new = record_with_spec(
+            "cname-rec",
+            "uid-c",
+            200,
+            json!({ "name": "app.example.com", "type": "CNAME", "content": { "value": "target.example.com" }, "zone": { "id": { "value": "zone-1" } } }),
+            None,
+        );
+
+        let (result, patched_status, cf_requests) =
+            run_apply_test(cname_new.clone(), vec![a_owner, cname_new], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(cf_requests, vec!["GET /zones/zone-1/dns_records?page=1"]);
+        let status = patched_status.expect("expected NameConflict status patch");
+        assert_eq!(status["conditions"][0]["reason"], "NameConflict");
+    }
+
+    #[tokio::test]
+    async fn apply_deletes_old_a_record_before_creating_cname_on_type_change() {
+        // regression: filtering update_dns_record_and_wait by type without delete-before-create made A -> CNAME
+        // edits fail forever because Cloudflare rejects creating CNAME while A exists at the same name
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_flag = deleted.clone();
+        let list_before = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-a", "app.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let list_after = r#"{"success":true,"errors":[],"messages":[],"result":[]}"#.to_string();
+        let delete_cf = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-a"}}"#.to_string();
+        let create_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": cf_record_json("rec-cname", "app.example.com", "CNAME", "target.example.com")
+        })
+        .to_string();
+
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => {
+                if deleted_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    (200, list_after.clone())
+                } else {
+                    (200, list_before.clone())
+                }
+            }
+            "DELETE" => {
+                deleted_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                (200, delete_cf.clone())
+            }
+            "POST" => {
+                assert!(
+                    deleted_flag.load(std::sync::atomic::Ordering::Relaxed),
+                    "old A record must be deleted before creating CNAME"
+                );
+                (200, create_cf.clone())
+            }
+            other => panic!("unexpected Cloudflare request: {other}"),
+        });
+
+        let changed = record_with_spec(
+            "web",
+            "uid-1",
+            100,
+            json!({ "name": "app.example.com", "type": "CNAME", "content": { "value": "target.example.com" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-a")),
+        );
+
+        let (result, patched_status, cf_requests) = run_apply_test(changed.clone(), vec![changed], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(
+            cf_requests,
+            vec![
+                "GET /zones/zone-1/dns_records?page=1",
+                "DELETE /zones/zone-1/dns_records/rec-a",
+                "GET /zones/zone-1/dns_records?page=1",
+                "POST /zones/zone-1/dns_records",
+            ]
         );
         let status = patched_status.expect("expected status patch");
+        assert_eq!(status["record_id"], "rec-cname");
+    }
+
+    #[tokio::test]
+    async fn apply_does_not_create_new_record_when_rename_delete_fails() {
+        // Delete-before-create ensures a transient delete error does not create an unrecorded new Cloudflare record.
+        let list_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [cf_record_json("rec-old", "old.example.com", "A", "1.2.3.4")]
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_cf.clone()),
+            "DELETE" => (
+                500,
+                r#"{"success":false,"errors":[{"code":1000,"message":"boom"}],"messages":[],"result":null}"#
+                    .to_string(),
+            ),
+            other => panic!("must not create new record when delete fails: {other}"),
+        });
+
+        let renamed = record_with_spec(
+            "web",
+            "uid-1",
+            100,
+            json!({ "name": "new.example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone-1" } } }),
+            Some(sample_status("zone-1", "rec-old")),
+        );
+
+        let (result, patched_status, cf_requests) = run_apply_test(renamed.clone(), vec![renamed], cf).await;
+
+        assert!(result.is_err(), "expected delete failure to return Err");
+        assert!(patched_status.is_none(), "status must stay on old record_id");
+        assert_eq!(
+            cf_requests,
+            vec![
+                "GET /zones/zone-1/dns_records?page=1",
+                "DELETE /zones/zone-1/dns_records/rec-old",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_deletes_old_cloudflare_record_on_zone_change() {
+        let empty_cf = r#"{"success":true,"errors":[],"messages":[],"result":[]}"#.to_string();
+        let delete_cf = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-old"}}"#.to_string();
+        let create_cf = json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": cf_record_json("rec-new", "app.example.com", "A", "1.2.3.4")
+        })
+        .to_string();
+        let cf = MockCloudflare::with_handler(move |method, path| match (method, path) {
+            ("GET", "/zones/zone-2/dns_records?page=1") => (200, empty_cf.clone()),
+            ("DELETE", "/zones/zone-1/dns_records/rec-old") => (200, delete_cf.clone()),
+            ("POST", "/zones/zone-2/dns_records") => (200, create_cf.clone()),
+            other => panic!("unexpected Cloudflare request: {other:?}"),
+        });
+
+        let moved_zone = record_with_spec(
+            "web",
+            "uid-1",
+            100,
+            json!({ "name": "app.example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone-2" } } }),
+            Some(sample_status("zone-1", "rec-old")),
+        );
+
+        let (result, patched_status, cf_requests) = run_apply_test(moved_zone.clone(), vec![moved_zone], cf).await;
+
+        assert!(result.is_ok(), "apply failed: {result:?}");
+        assert_eq!(
+            cf_requests,
+            vec![
+                "GET /zones/zone-2/dns_records?page=1",
+                "DELETE /zones/zone-1/dns_records/rec-old",
+                "POST /zones/zone-2/dns_records",
+            ]
+        );
+        let status = patched_status.expect("expected status patch");
+        assert_eq!(status["zone_id"], "zone-2");
         assert_eq!(status["record_id"], "rec-new");
     }
 }

@@ -53,6 +53,12 @@ impl RecordType {
             RecordType::NS => "NS",
         }
     }
+
+    /// Whether two record types cannot coexist independently at the same `(zone, name)`:
+    /// either they are the same type, or one of them is a `CNAME`.
+    pub fn conflicts_with(self, other: Self) -> bool {
+        self == other || matches!(self, RecordType::CNAME) || matches!(other, RecordType::CNAME)
+    }
 }
 
 /// Normalizes a DNS name for case-insensitive comparison without trailing dots.
@@ -80,6 +86,10 @@ impl std::str::FromStr for RecordType {
 }
 
 /// [CustomResource] definition for a Cloudflare DNS record.
+///
+/// Only one Cloudflare value per `(zone, name, type)` is supported across `CloudflareDNSRecord` objects in a cluster:
+/// records with identical `(zone, name, type, content)` share one Cloudflare record, while records with differing
+/// content (including multi-value `TXT`, `MX`, or `NS` setups) are refused with `NameConflict`.
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "dns.cloudflare.com",
