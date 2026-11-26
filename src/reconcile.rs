@@ -15,10 +15,7 @@ use crate::{
         ZoneNameOrId,
     },
 };
-use eyre::{
-    Context as _,
-    OptionExt as _,
-};
+use eyre::OptionExt as _;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{
     api::{
@@ -157,22 +154,14 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
         error_condition(&resource, "pending", msg, gen)
     };
 
-    let patched = CloudflareDNSRecord {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(ns.to_string()),
-            ..Default::default()
-        },
-        spec: resource.spec.clone(),
-        status: Some(CloudflareDNSRecordStatus {
-            // We are storing the details about how we created the record in the
-            // status. At deletion time, the configmap / secrets we got the
-            // zone_id from might be gone already.
-            record_id: record.id,
-            zone_id,
-            pending,
-            conditions: Some(vec![condition]),
-        }),
+    let status = CloudflareDNSRecordStatus {
+        // We are storing the details about how we created the record in the
+        // status. At deletion time, the configmap / secrets we got the
+        // zone_id from might be gone already.
+        record_id: record.id,
+        zone_id,
+        pending,
+        conditions: Some(vec![condition]),
     };
 
     if is_new && ctx.do_dns_check {
@@ -185,17 +174,7 @@ pub async fn apply(resource: Arc<CloudflareDNSRecord>, ctx: Arc<Context>) -> Res
             .await;
     }
 
-    Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns)
-        .patch(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
-        .await
-        .context("unable to patch CloudflareDNSRecord with record details")?;
-
-    Api::<CloudflareDNSRecord>::namespaced(client.clone(), ns)
-        .patch_status(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
-        .await
-        .context("unable to patch CloudflareDNSRecord with record details")?;
-
-    Ok(())
+    write_status(&resource, &ctx, status).await
 }
 
 /// This functions runs before the resource is deleted. It'll try to delete the DNS record from Cloudflare.
@@ -227,9 +206,23 @@ pub async fn update_conditions(
     ctx: &Context,
     conditions: Vec<Condition>,
 ) -> Result<(), ReconcileError> {
+    let status = CloudflareDNSRecordStatus {
+        conditions: Some(conditions),
+        ..resource.status.clone().unwrap_or_default()
+    };
+    write_status(resource, ctx, status).await
+}
+
+/// Writes the status, the only part of a CloudflareDNSRecord that the reconcile changes. It patches the status
+/// subresource, which, unlike the object itself, the API server never creates. So a reconcile that runs while the
+/// object gets deleted cannot bring the object back.
+async fn write_status(
+    resource: &CloudflareDNSRecord,
+    ctx: &Context,
+    status: CloudflareDNSRecordStatus,
+) -> Result<(), ReconcileError> {
     let name = resource.metadata.name.as_deref().ok_or_eyre("missing name")?;
     let ns = resource.metadata.namespace.as_deref().unwrap_or("default");
-    let status = resource.status.clone().unwrap_or_default();
 
     let patched = CloudflareDNSRecord {
         metadata: ObjectMeta {
@@ -238,16 +231,62 @@ pub async fn update_conditions(
             ..Default::default()
         },
         spec: resource.spec.clone(),
-        status: Some(CloudflareDNSRecordStatus {
-            conditions: Some(conditions),
-            ..status
-        }),
+        status: Some(status),
     };
 
     Api::<CloudflareDNSRecord>::namespaced(ctx.client.clone(), ns)
         .patch_status(name, &PatchParams::apply("dns.cloudflare.com"), &Patch::Apply(&patched))
-        .await
-        .context("unable to patch CloudflareDNSRecord with record details")?;
+        .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{
+        Method,
+        Request,
+        Response,
+    };
+    use kube::client::Body;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn status_write_cannot_recreate_a_deleted_record() {
+        // regression: the reconcile applied the whole object, which recreated a record that was deleted while the
+        // reconcile ran (pr-6843-admin-dns, 2026-11-26)
+        let (service, mut api_server) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let ctx = Context {
+            client: kube::Client::new(service, "default"),
+            cloudflare_api: cloudflare::CloudflareApi::new(String::new()),
+            do_dns_check: false,
+            dns_check_tx: tokio::sync::mpsc::channel(1).0,
+            dns_lookup_success: Default::default(),
+        };
+        let spec =
+            json!({ "name": "example.com", "content": { "value": "1.2.3.4" }, "zone": { "id": { "value": "zone" } } });
+        let mut record = CloudflareDNSRecord::new("web", serde_json::from_value(spec).unwrap());
+        record.metadata.namespace = Some("app".to_string());
+
+        let deleted_record = async {
+            let (request, respond) = api_server.next_request().await.expect("a request");
+            assert_eq!(request.method(), Method::PATCH);
+            assert_eq!(
+                request.uri().path(),
+                "/apis/dns.cloudflare.com/v1alpha1/namespaces/app/cloudflarednsrecords/web/status"
+            );
+            let not_found = json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "NotFound", "code": 404, "message": "not found" });
+            respond.send_response(
+                Response::builder()
+                    .status(404)
+                    .body(Body::from(not_found.to_string().into_bytes()))
+                    .unwrap(),
+            );
+        };
+        let (result, ()) = tokio::join!(write_status(&record, &ctx, Default::default()), deleted_record);
+
+        // main.rs logs this error as a warning
+        assert!(matches!(result, Err(ReconcileError::Kube(kube::Error::Api(err))) if err.code == 404));
+    }
 }
