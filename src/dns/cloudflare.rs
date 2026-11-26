@@ -590,11 +590,12 @@ where
     let res = req.send().await?;
 
     if !res.status().is_success() {
-        return Err(CloudflareApiError {
-            status: res.status(),
-            body: res.text().await?,
-        }
-        .into());
+        let status = res.status();
+        let body = res
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+        return Err(CloudflareApiError { status, body }.into());
     }
 
     #[cfg(debug_assertions)]
