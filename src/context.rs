@@ -13,4 +13,8 @@ pub struct Context {
     pub dns_check_tx: DnsCheckSender,
     /// Maps CloudflareDNSRecord `{ns}:{name}` keys to DNS lookup results.
     pub dns_lookup_success: Mutex<HashMap<String, bool>>,
+    /// Serializes `apply` and `cleanup` in this process so reference counts and status writes do not race.
+    // lessismore: one global lock + a full cluster list per apply is simple and fine at current scale (~300 records);
+    // revisit with per-name locking if reconcile queue wait times grow or record counts reach the thousands.
+    pub reconcile_lock: Mutex<()>,
 }

@@ -1,5 +1,8 @@
 use super::util;
-use crate::resources::RecordType;
+use crate::resources::{
+    normalize_dns_name,
+    RecordType,
+};
 use chrono::{
     prelude::*,
     Duration,
@@ -369,19 +372,25 @@ impl CloudflareApi {
 
         debug!("updating dns record");
 
-        let domain = args.name.clone();
+        let domain = normalize_dns_name(&args.name);
+        let record_type = args.record_type;
         let dns_records = self.list_dns_records(&zone_id).await?;
 
         let mut existing = None;
-        for record in dns_records.into_iter().filter(|record| record.name == domain) {
+        for record in dns_records.into_iter().filter(|record| {
+            normalize_dns_name(&record.name) == domain && record.record_type.eq_ignore_ascii_case(record_type.as_str())
+        }) {
             if record.content == args.content {
                 existing = Some(record);
-                info!("DNS record for {domain:?} already exists with {:?}", args.content);
+                info!(
+                    "DNS record for {domain:?} ({record_type:?}) already exists with {:?}",
+                    args.content
+                );
                 continue;
             }
 
             warn!(
-                "Found existing DNS record for web domain {domain:?} with ip {:?}. Deleting.",
+                "Found existing DNS record for web domain {domain:?} ({record_type:?}) with ip {:?}. Deleting.",
                 record.content
             );
             self.delete_dns_record(&zone_id, &record.id)
@@ -393,7 +402,10 @@ impl CloudflareApi {
             return Ok(existing);
         }
 
-        info!("Creating new DNS record for {domain:?} with {:?}", args.content);
+        info!(
+            "Creating new DNS record for {domain:?} ({record_type:?}) with {:?}",
+            args.content
+        );
         let record = self.create_dns_record(args).await?;
         debug!("Registered record for {domain:?} with {:?}", record.content);
 
@@ -409,7 +421,7 @@ impl CloudflareApi {
         name: impl AsRef<str>,
         zone_identifier: impl AsRef<str>,
     ) -> Result<(), eyre::Error> {
-        let name = name.as_ref();
+        let name = normalize_dns_name(name.as_ref());
         let zone_identifier = zone_identifier.as_ref();
 
         info!(?name, "deleting dns record by name");
@@ -417,7 +429,7 @@ impl CloudflareApi {
             .list_dns_records(&zone_identifier)
             .await?
             .into_iter()
-            .filter(|it| it.name == name);
+            .filter(|it| normalize_dns_name(&it.name) == name);
 
         for record in records {
             self.delete_dns_record(zone_identifier, record.id).await?;
@@ -500,6 +512,128 @@ fn has_more_pages(info: Option<&ApiResultInfo>, page_len: usize, current_page: u
 }
 
 #[cfg(test)]
+pub(crate) struct MockCloudflare {
+    pub(crate) base_url: String,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl MockCloudflare {
+    pub(crate) fn start(status: u16, body: &'static str) -> Self {
+        Self::with_handler(move |_method, _path| (status, body.to_string()))
+    }
+
+    pub(crate) fn with_handler(handler: impl Fn(&str, &str) -> (u16, String) + Send + 'static) -> Self {
+        use std::{
+            io::{
+                Read as _,
+                Write as _,
+            },
+            sync::atomic::Ordering,
+            time::Duration,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reqs = requests.clone();
+        let stop_flag = stop.clone();
+
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+                        // Read until end of HTTP headers, then drain any Content-Length body before responding.
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let header_end = loop {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(pos + 4);
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break None,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        if let Some(header_end) = header_end {
+                            let headers_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                            let content_len: usize = headers_text
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            while buf.len() < header_end + content_len {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            }
+                            let first_line = headers_text.lines().next().unwrap_or("");
+                            let mut parts = first_line.split_whitespace();
+                            let method = parts.next().unwrap_or("");
+                            let path = parts.next().unwrap_or("");
+                            if !method.is_empty() && !path.is_empty() {
+                                reqs.lock().unwrap().push(format!("{method} {path}"));
+                            }
+                            let (status, body) = handler(method, path);
+                            let resp = format!(
+                                "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.flush();
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        }
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for MockCloudflare {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -549,6 +683,113 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(err.downcast_ref::<reqwest::Error>().unwrap().is_timeout(), "{err:?}");
+    }
+
+    fn record_json(id: &str, name: &str, record_type: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "type": record_type,
+            "content": content,
+            "ttl": 300,
+            "proxiable": record_type != "TXT",
+            "proxied": false,
+            "created_on": "2026-01-01T00:00:00Z",
+            "modified_on": "2026-01-01T00:00:00Z",
+            "meta": {},
+            "tags": []
+        })
+    }
+
+    #[tokio::test]
+    async fn update_dns_record_matches_record_type_and_normalized_name() {
+        // regression: update_dns_record_and_wait filtered only by exact `record.name == domain`, so reconciling an A
+        // record deleted TXT/AAAA records with the same name and missed uppercase or trailing-dot names
+        let list_body = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [
+                record_json("rec-txt", "example.com", "TXT", "v=spf1 -all"),
+                record_json("rec-a", "EXAMPLE.COM", "A", "1.2.3.4"),
+            ]
+        })
+        .to_string();
+
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_body.clone()),
+            other => panic!("unexpected Cloudflare request: {other}"),
+        });
+
+        let api = CloudflareApi::with_base_url("token".to_string(), &cf.base_url);
+        let record = api
+            .update_dns_record_and_wait(CreateRecordArgs {
+                zone: Zone::id("zone-1"),
+                name: "example.com.".to_string(),
+                record_type: RecordType::A,
+                content: "1.2.3.4".to_string(),
+                comment: None,
+                ttl: None,
+            })
+            .await
+            .expect("update_dns_record_and_wait failed");
+
+        let seen = cf.finish();
+        assert_eq!(record.id, "rec-a", "should reuse existing A record; requests: {seen:?}");
+        assert_eq!(seen, vec!["GET /zones/zone-1/dns_records?page=1"]);
+    }
+
+    #[tokio::test]
+    async fn update_dns_record_replaces_mismatched_same_type_without_deleting_other_types() {
+        let list_body = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": [
+                record_json("rec-txt", "example.com", "TXT", "v=spf1 -all"),
+                record_json("rec-a-old", "EXAMPLE.COM", "A", "1.2.3.4"),
+            ]
+        })
+        .to_string();
+        let created_body = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": record_json("rec-a-new", "example.com", "A", "5.6.7.8")
+        })
+        .to_string();
+        let deleted_body = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rec-a-old"}}"#.to_string();
+
+        let cf = MockCloudflare::with_handler(move |method, _path| match method {
+            "GET" => (200, list_body.clone()),
+            "DELETE" => (200, deleted_body.clone()),
+            "POST" => (200, created_body.clone()),
+            other => panic!("unexpected Cloudflare request: {other}"),
+        });
+
+        let api = CloudflareApi::with_base_url("token".to_string(), &cf.base_url);
+        let record = api
+            .update_dns_record_and_wait(CreateRecordArgs {
+                zone: Zone::id("zone-1"),
+                name: "example.com".to_string(),
+                record_type: RecordType::A,
+                content: "5.6.7.8".to_string(),
+                comment: None,
+                ttl: None,
+            })
+            .await
+            .expect("update_dns_record_and_wait failed");
+
+        let seen = cf.finish();
+        assert_eq!(record.id, "rec-a-new");
+        assert_eq!(
+            seen,
+            vec![
+                "GET /zones/zone-1/dns_records?page=1",
+                "DELETE /zones/zone-1/dns_records/rec-a-old",
+                "POST /zones/zone-1/dns_records",
+            ]
+        );
     }
 }
 

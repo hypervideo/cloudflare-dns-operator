@@ -16,7 +16,7 @@ use serde::{
 ///
 /// See https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/#dns-record-types
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Default, Debug, PartialEq, Serialize, Deserialize, Clone, Copy, JsonSchema)]
+#[derive(Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy, JsonSchema)]
 pub enum RecordType {
     #[default]
     #[serde(rename = "A")]
@@ -39,6 +39,33 @@ pub enum RecordType {
     NS,
 }
 
+impl RecordType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecordType::A => "A",
+            RecordType::AAAA => "AAAA",
+            RecordType::CNAME => "CNAME",
+            RecordType::MX => "MX",
+            RecordType::TXT => "TXT",
+            RecordType::SRV => "SRV",
+            RecordType::LOC => "LOC",
+            RecordType::SPF => "SPF",
+            RecordType::NS => "NS",
+        }
+    }
+
+    /// Whether two record types cannot coexist independently at the same `(zone, name)`:
+    /// either they are the same type, or one of them is a `CNAME`.
+    pub fn conflicts_with(self, other: Self) -> bool {
+        self == other || matches!(self, RecordType::CNAME) || matches!(other, RecordType::CNAME)
+    }
+}
+
+/// Normalizes a DNS name for case-insensitive comparison without trailing dots.
+pub fn normalize_dns_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 impl std::str::FromStr for RecordType {
     type Err = eyre::Report;
 
@@ -59,6 +86,10 @@ impl std::str::FromStr for RecordType {
 }
 
 /// [CustomResource] definition for a Cloudflare DNS record.
+///
+/// Only one Cloudflare value per `(zone, name, type)` is supported across `CloudflareDNSRecord` objects in a cluster:
+/// records with identical `(zone, name, type, content)` share one Cloudflare record, while records with differing
+/// content (including multi-value `TXT`, `MX`, or `NS` setups) are refused with `NameConflict`.
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "dns.cloudflare.com",
